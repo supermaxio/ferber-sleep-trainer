@@ -5,9 +5,11 @@ import Charts
 // MARK: - History View
 struct HistoryView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var modelContext
     @Query(sort: \SleepSession.date, order: .reverse) private var sessions: [SleepSession]
     
     @State private var selectedTab: HistoryTab = .history
+    @State private var localSessions: [SleepSession] = []
     
     enum HistoryTab: String, CaseIterable {
         case history = "History"
@@ -21,7 +23,7 @@ struct HistoryView: View {
                 Color.black
                     .ignoresSafeArea()
                 
-                if sessions.isEmpty {
+                if displayedSessions.isEmpty {
                     EmptyStateView()
                 } else {
                     VStack(spacing: 0) {
@@ -37,10 +39,10 @@ struct HistoryView: View {
                         
                         // Content based on selected tab
                         TabView(selection: $selectedTab) {
-                            SessionHistoryList(sessions: sessions)
+                            SessionHistoryList(sessions: displayedSessions)
                                 .tag(HistoryTab.history)
                             
-                            TrendsView(sessions: sessions)
+                            TrendsView(sessions: displayedSessions)
                                 .tag(HistoryTab.trends)
                         }
                         .tabViewStyle(.page(indexDisplayMode: .never))
@@ -55,15 +57,30 @@ struct HistoryView: View {
                     Button {
                         dismiss()
                     } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "chevron.left")
-                            Text("Back")
-                        }
-                        .foregroundColor(.blue)
+                        Image(systemName: "xmark")
+                            .font(.headline)
+                            .frame(width: 36, height: 36)
+                            .contentShape(Rectangle())
                     }
+                    .foregroundColor(.blue)
+                    .accessibilityLabel("Close")
                 }
             }
+            .onAppear {
+                refreshLocalSessions()
+            }
         }
+    }
+    
+    private var displayedSessions: [SleepSession] {
+        localSessions
+    }
+    
+    private func refreshLocalSessions() {
+        localSessions = LocalSessionStore.load()
+            .map { $0.makeSleepSession() }
+            .sorted { $0.date > $1.date }
+        print("History JSON fetch found \(localSessions.count) local sessions")
     }
 }
 
@@ -215,8 +232,12 @@ struct SessionRowView: View {
             // Expanded check-ins
             if isExpanded && !session.checkIns.isEmpty {
                 VStack(spacing: 0) {
-                    ForEach(session.checkIns.sorted(by: { $0.checkInNumber < $1.checkInNumber })) { checkIn in
-                        CheckInRowView(checkIn: checkIn)
+                    ForEach(sortedCheckIns.indices, id: \.self) { index in
+                        let checkIn = sortedCheckIns[index]
+                        CheckInRowView(
+                            checkIn: checkIn,
+                            waitDuration: waitDuration(for: index, in: sortedCheckIns)
+                        )
                     }
                 }
                 .padding(.leading, 40)
@@ -225,11 +246,23 @@ struct SessionRowView: View {
             }
         }
     }
+    
+    private var sortedCheckIns: [CheckIn] {
+        session.checkIns.sorted { $0.checkInNumber < $1.checkInNumber }
+    }
+    
+    private func waitDuration(for index: Int, in checkIns: [CheckIn]) -> TimeInterval {
+        let waitStart = index == 0
+            ? session.startTime
+            : checkIns[index - 1].endTime ?? checkIns[index - 1].timestamp
+        return max(0, checkIns[index].timestamp.timeIntervalSince(waitStart))
+    }
 }
 
 // MARK: - Check-In Row View
 struct CheckInRowView: View {
     let checkIn: CheckIn
+    let waitDuration: TimeInterval
     
     var body: some View {
         HStack(spacing: 12) {
@@ -241,34 +274,66 @@ struct CheckInRowView: View {
             }
             
             // Check-in info
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Check-in #\(checkIn.checkInNumber)")
-                        .font(.subheadline)
-                        .foregroundColor(.white.opacity(0.9))
-                    
-                    if checkIn.checkInDuration != nil {
-                        Text("In room: \(checkIn.formattedCheckInDuration)")
-                            .font(.caption2)
-                            .foregroundColor(.gray)
-                    }
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Check-in #\(checkIn.checkInNumber)")
+                    .font(.subheadline)
+                    .foregroundColor(.white.opacity(0.9))
+                
+                HStack(spacing: 10) {
+                    Label("Waited \(formatDuration(waitDuration))", systemImage: "hourglass")
+                    Label("Check-in \(formattedCheckInDuration)", systemImage: "timer")
                 }
-                
-                Spacer()
-                
-                Text("after \(checkIn.formattedInterval)")
-                    .font(.caption)
-                    .foregroundColor(.purple)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(
-                        Capsule()
-                            .fill(Color.purple.opacity(0.2))
-                    )
+                .font(.caption2)
+                .foregroundColor(.gray)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 8)
         }
         .padding(.leading, 16)
+    }
+    
+    private var formattedCheckInDuration: String {
+        guard let duration = checkIn.checkInDuration else { return "in progress" }
+        return formatDuration(duration)
+    }
+    
+    private func formatDuration(_ duration: TimeInterval) -> String {
+        let totalSeconds = max(0, Int(duration.rounded()))
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+        
+        if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        }
+        if minutes > 0 {
+            return "\(minutes)m \(seconds)s"
+        }
+        return "\(seconds)s"
+    }
+}
+
+// MARK: - Night Trend Summary
+struct NightTrendSummary: Identifiable {
+    let nightNumber: Int
+    let sessions: [SleepSession]
+    
+    var id: Int { nightNumber }
+    
+    var completedSessions: [SleepSession] {
+        sessions.filter { $0.totalDurationToSleep != nil }
+    }
+    
+    var bestCompletedSession: SleepSession? {
+        completedSessions.min { ($0.totalDurationToSleep ?? .infinity) < ($1.totalDurationToSleep ?? .infinity) }
+    }
+    
+    var totalCheckIns: Int {
+        sessions.reduce(0) { $0 + $1.checkInCount }
+    }
+    
+    var formattedBestDuration: String {
+        bestCompletedSession?.formattedTotalDuration ?? "--"
     }
 }
 
@@ -276,17 +341,27 @@ struct CheckInRowView: View {
 struct TrendsView: View {
     let sessions: [SleepSession]
     
-    private var completedSessions: [SleepSession] {
-        sessions.filter { $0.fellAsleep && $0.totalDurationToSleep != nil }
+    private var nightSummaries: [NightTrendSummary] {
+        Dictionary(grouping: sessions, by: \.nightNumber)
+            .map { nightNumber, sessions in
+                NightTrendSummary(
+                    nightNumber: nightNumber,
+                    sessions: sessions.sorted { $0.startTime < $1.startTime }
+                )
+            }
             .sorted { $0.nightNumber < $1.nightNumber }
     }
     
+    private var completedNightSummaries: [NightTrendSummary] {
+        nightSummaries.filter { !$0.completedSessions.isEmpty }
+    }
+    
     private var totalNights: Int {
-        sessions.count
+        nightSummaries.count
     }
     
     private var successfulNights: Int {
-        sessions.filter { $0.fellAsleep }.count
+        completedNightSummaries.count
     }
     
     private var averageCheckInDuration: TimeInterval {
@@ -296,8 +371,11 @@ struct TrendsView: View {
         return durations.reduce(0, +) / Double(durations.count)
     }
     
-    private var bestNight: SleepSession? {
-        completedSessions.min { ($0.totalDurationToSleep ?? .infinity) < ($1.totalDurationToSleep ?? .infinity) }
+    private var bestNight: NightTrendSummary? {
+        completedNightSummaries.min {
+            ($0.bestCompletedSession?.totalDurationToSleep ?? .infinity) <
+                ($1.bestCompletedSession?.totalDurationToSleep ?? .infinity)
+        }
     }
     
     var body: some View {
@@ -312,14 +390,14 @@ struct TrendsView: View {
                 )
                 
                 // Time to Sleep Chart
-                if completedSessions.count >= 2 {
-                    ChartCard(title: "Time to Sleep", subtitle: "Should trend down over time") {
-                        TimeToSleepChart(sessions: completedSessions)
+                if completedNightSummaries.count >= 2 {
+                    ChartCard(title: "Time to Sleep", subtitle: "Best completed session per night") {
+                        TimeToSleepChart(nights: completedNightSummaries)
                     }
                     
                     // Check-ins Chart
-                    ChartCard(title: "Check-ins per Night", subtitle: "Number of visits needed") {
-                        CheckInsChart(sessions: completedSessions)
+                    ChartCard(title: "Check-ins per Night", subtitle: "Total check-ins across sessions") {
+                        CheckInsChart(nights: nightSummaries)
                     }
                 } else {
                     InsufficientDataCard()
@@ -335,7 +413,7 @@ struct SummaryStatsView: View {
     let totalNights: Int
     let successfulNights: Int
     let averageCheckInDuration: TimeInterval
-    let bestNight: SleepSession?
+    let bestNight: NightTrendSummary?
     
     var body: some View {
         VStack(spacing: 16) {
@@ -362,7 +440,7 @@ struct SummaryStatsView: View {
                         icon: "trophy.fill",
                         title: "Best Night",
                         value: "Night \(best.nightNumber)",
-                        subtitle: best.formattedTotalDuration,
+                        subtitle: best.formattedBestDuration,
                         color: .yellow
                     )
                     
@@ -463,13 +541,13 @@ struct ChartCard<Content: View>: View {
 
 // MARK: - Time to Sleep Chart
 struct TimeToSleepChart: View {
-    let sessions: [SleepSession]
+    let nights: [NightTrendSummary]
     
     var body: some View {
-        Chart(sessions) { session in
+        Chart(nights) { night in
             LineMark(
-                x: .value("Night", "Night \(session.nightNumber)"),
-                y: .value("Minutes", (session.totalDurationToSleep ?? 0) / 60)
+                x: .value("Night", "Night \(night.nightNumber)"),
+                y: .value("Minutes", (night.bestCompletedSession?.totalDurationToSleep ?? 0) / 60)
             )
             .foregroundStyle(
                 LinearGradient(
@@ -482,8 +560,8 @@ struct TimeToSleepChart: View {
             .lineStyle(StrokeStyle(lineWidth: 3, lineCap: .round))
             
             AreaMark(
-                x: .value("Night", "Night \(session.nightNumber)"),
-                y: .value("Minutes", (session.totalDurationToSleep ?? 0) / 60)
+                x: .value("Night", "Night \(night.nightNumber)"),
+                y: .value("Minutes", (night.bestCompletedSession?.totalDurationToSleep ?? 0) / 60)
             )
             .foregroundStyle(
                 LinearGradient(
@@ -495,8 +573,8 @@ struct TimeToSleepChart: View {
             .interpolationMethod(.catmullRom)
             
             PointMark(
-                x: .value("Night", "Night \(session.nightNumber)"),
-                y: .value("Minutes", (session.totalDurationToSleep ?? 0) / 60)
+                x: .value("Night", "Night \(night.nightNumber)"),
+                y: .value("Minutes", (night.bestCompletedSession?.totalDurationToSleep ?? 0) / 60)
             )
             .foregroundStyle(.white)
             .symbolSize(40)
@@ -524,13 +602,13 @@ struct TimeToSleepChart: View {
 
 // MARK: - Check-ins Chart
 struct CheckInsChart: View {
-    let sessions: [SleepSession]
+    let nights: [NightTrendSummary]
     
     var body: some View {
-        Chart(sessions) { session in
+        Chart(nights) { night in
             BarMark(
-                x: .value("Night", "Night \(session.nightNumber)"),
-                y: .value("Check-ins", session.checkInCount)
+                x: .value("Night", "Night \(night.nightNumber)"),
+                y: .value("Check-ins", night.totalCheckIns)
             )
             .foregroundStyle(
                 LinearGradient(

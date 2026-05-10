@@ -3,9 +3,7 @@ import SwiftData
 
 @main
 struct FerberApp: App {
-    
     init() {
-        // Register notification categories on app launch
         NotificationManager.shared.registerCategories()
     }
     
@@ -13,7 +11,6 @@ struct FerberApp: App {
         WindowGroup {
             ContentView()
                 .task {
-                    // Request notification permission on first launch
                     await NotificationManager.shared.requestPermission()
                 }
         }
