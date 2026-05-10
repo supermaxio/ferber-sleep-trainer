@@ -247,7 +247,7 @@ struct CheckInRowView: View {
                         .font(.subheadline)
                         .foregroundColor(.white.opacity(0.9))
                     
-                    if let duration = checkIn.checkInDuration {
+                    if checkIn.checkInDuration != nil {
                         Text("In room: \(checkIn.formattedCheckInDuration)")
                             .font(.caption2)
                             .foregroundColor(.gray)

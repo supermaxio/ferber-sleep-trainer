@@ -12,6 +12,7 @@ enum SessionState: Equatable {
 
 // MARK: - Session View Model
 
+@MainActor
 @Observable
 final class SessionViewModel {
     var state: SessionState = .idle
@@ -34,23 +35,19 @@ final class SessionViewModel {
         currentSession?.checkIns.count ?? 0
     }
     
-    /// Get the interval for a given check-in number based on Ferber method
+    /// Get the interval in seconds for a given check-in number based on Ferber method
     func intervalForCheckIn(_ checkInNumber: Int) -> TimeInterval {
-        guard let config = nightConfig else {
-            // Default night 1 intervals if no config
-            switch checkInNumber {
-            case 1: return 180  // 3 min
-            case 2: return 300  // 5 min
-            default: return 600 // 10 min
-            }
-        }
+        let intervals = nightConfig?.intervals ?? NightConfiguration.defaultIntervals(for: currentNight)
+        let intervalMinutes: Int
         
         switch checkInNumber {
-        case 1: return config.firstInterval
-        case 2: return config.secondInterval
-        case 3: return config.thirdInterval
-        default: return config.subsequentInterval
+        case 1: intervalMinutes = intervals[0]
+        case 2: intervalMinutes = intervals[1]
+        case 3: intervalMinutes = intervals[2]
+        default: intervalMinutes = intervals[3]
         }
+        
+        return TimeInterval(intervalMinutes * 60)
     }
     
     var currentIntervalSeconds: Int {
@@ -103,8 +100,10 @@ final class SessionViewModel {
     }
     
     func loadNightConfiguration(modelContext: ModelContext) {
-        let configs = NightConfiguration.defaultIntervals()
-        nightConfig = configs.first { $0.nightNumber == currentNight }
+        let descriptor = FetchDescriptor<NightConfiguration>(
+            predicate: #Predicate { $0.nightNumber == currentNight }
+        )
+        nightConfig = try? modelContext.fetch(descriptor).first
     }
     
     func startSession(modelContext: ModelContext) {
@@ -117,7 +116,7 @@ final class SessionViewModel {
         startTimer()
         
         // Schedule notification for first check-in
-        NotificationManager.shared.scheduleCheckInAlert(in: intervalSeconds)
+        NotificationManager.shared.scheduleCheckNotification(afterSeconds: TimeInterval(intervalSeconds), checkNumber: 1)
     }
     
     private func startWaiting(intervalSeconds: Int, checkInNumber: Int) {
@@ -131,7 +130,7 @@ final class SessionViewModel {
         
         // Record the check-in with the duration waited
         let checkIn = CheckIn(
-            duration: TimeInterval(intervalSeconds),
+            intervalMinutes: intervalSeconds / 60,
             checkInNumber: checkInNumber
         )
         currentSession?.checkIns.append(checkIn)
@@ -142,7 +141,7 @@ final class SessionViewModel {
         checkInSecondsElapsed = 0
         
         // Schedule leave room reminder
-        NotificationManager.shared.scheduleLeaveRoomAlert(in: maxCheckInDuration)
+        NotificationManager.shared.scheduleLeaveRoomNotification(afterSeconds: TimeInterval(maxCheckInDuration))
     }
     
     func finishCheckIn(modelContext: ModelContext) {
@@ -155,15 +154,18 @@ final class SessionViewModel {
         
         startWaiting(intervalSeconds: nextIntervalSeconds, checkInNumber: nextCheckInNumber)
         
+        currentSession?.checkIns.last?.endTime = Date()
+        
         // Schedule next check-in notification
-        NotificationManager.shared.scheduleCheckInAlert(in: nextIntervalSeconds)
+        NotificationManager.shared.scheduleCheckNotification(afterSeconds: TimeInterval(nextIntervalSeconds), checkNumber: nextCheckInNumber)
     }
     
     func babyFellAsleep(modelContext: ModelContext) {
         guard let session = currentSession else { return }
         
+        currentSession?.checkIns.last?.endTime = currentSession?.checkIns.last?.endTime ?? Date()
         session.endTime = Date()
-        session.isCompleted = true
+        session.fellAsleep = true
         
         stopTimer()
         resetSession()
@@ -176,8 +178,9 @@ final class SessionViewModel {
     func cancelSession(modelContext: ModelContext) {
         guard let session = currentSession else { return }
         
+        currentSession?.checkIns.last?.endTime = currentSession?.checkIns.last?.endTime ?? Date()
         session.endTime = Date()
-        session.isCompleted = false
+        session.fellAsleep = false
         
         stopTimer()
         resetSession()
@@ -192,7 +195,7 @@ final class SessionViewModel {
         sessionSecondsElapsed = 0
         
         // Cancel all pending notifications when session ends
-        NotificationManager.shared.cancelAll()
+        NotificationManager.shared.cancelAllNotifications()
     }
     
     private func startTimer() {
@@ -307,7 +310,7 @@ struct SessionView: View {
         case .idle:
             idleView
         case .waiting(_, let checkInNumber):
-            waitingView(checkInNumber: checkInNumber)
+            waitingView(checkInNumber)
         case .checkIn(let checkInNumber):
             checkInView(checkInNumber: checkInNumber)
         }
@@ -351,9 +354,9 @@ struct SessionView: View {
     
     // MARK: - Waiting View
     
-    private var waitingView: (Int) -> some View {
-        { checkInNumber in
-            VStack(spacing: 24) {
+    @ViewBuilder
+    private func waitingView(_ checkInNumber: Int) -> some View {
+        VStack(spacing: 24) {
                 // Status label
                 Label("Waiting", systemImage: "hourglass")
                     .font(.subheadline)
@@ -417,13 +420,12 @@ struct SessionView: View {
                 }
             }
         }
-    }
     
     // MARK: - Check-In View
     
-    private var checkInView: (Int) -> some View {
-        { checkInNumber in
-            VStack(spacing: 24) {
+    @ViewBuilder
+    private func checkInView(checkInNumber: Int) -> some View {
+        VStack(spacing: 24) {
                 // Status label
                 Label("Check-In #\(checkInNumber)", systemImage: "figure.and.child.holdinghands")
                     .font(.subheadline)
@@ -472,7 +474,6 @@ struct SessionView: View {
                 .padding(.top, 16)
             }
         }
-    }
     
     private var checkInTimeColor: Color {
         if viewModel.checkInSecondsElapsed >= viewModel.maxCheckInDuration {
