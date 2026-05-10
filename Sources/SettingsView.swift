@@ -427,10 +427,9 @@ struct SettingsView: View {
             let importedSessions = try HistoryCSVImporter.importSessions(from: csv)
             
             for session in importedSessions {
-                modelContext.insert(session)
+                LocalSessionStore.upsert(LocalSessionStore.storedSession(from: session))
             }
             
-            try modelContext.save()
             syncHouseholdSilentlyIfConfigured()
             showImportResult(
                 title: "Import Complete",
@@ -477,7 +476,9 @@ struct HistoryImportTemplateDocument: FileDocument {
     private static let template = """
     night,date,start_time,end_time,fell_asleep,check_ins
     1,2026-05-10,19:30,20:15,true,3/45;5/30;10/40
-    1,2026-05-10,21:00,21:25,true,3/30;5/20
+    1,2026-05-10,23:00,23:08,true,3/45;5/30
+    1,2026-05-11,00:20,00:32,true,3/45;5/30;10/40
+    1,2026-05-11,04:02,04:45,true,3/45;5/30;10/40;10/40
     2,2026-05-11,19:45,20:10,false,5/60;10/45
     
     """
@@ -577,6 +578,7 @@ struct HistoryCSVImporter {
         
         let sessionEndTime = explicitEndTime ?? (fellAsleep ? cursor : nil)
         let session = SleepSession(
+            syncID: UUID().uuidString,
             nightNumber: nightNumber,
             date: startTime,
             startTime: startTime,

@@ -39,8 +39,11 @@ struct HistoryView: View {
                         
                         // Content based on selected tab
                         TabView(selection: $selectedTab) {
-                            SessionHistoryList(sessions: displayedSessions)
-                                .tag(HistoryTab.history)
+                            SessionHistoryList(
+                                sessions: displayedSessions,
+                                onDelete: deleteSession
+                            )
+                            .tag(HistoryTab.history)
                             
                             TrendsView(sessions: displayedSessions)
                                 .tag(HistoryTab.trends)
@@ -82,6 +85,38 @@ struct HistoryView: View {
             .sorted { $0.date > $1.date }
         print("History JSON fetch found \(localSessions.count) local sessions")
     }
+    
+    private func deleteSession(_ session: SleepSession) {
+        guard let syncID = session.syncID else { return }
+        LocalSessionStore.delete(syncID: syncID)
+        removeRecentSessionSummary(id: syncID)
+        deleteLegacySwiftDataSession(syncID: syncID)
+        refreshLocalSessions()
+    }
+    
+    private func removeRecentSessionSummary(id: String) {
+        let key = "recentSessionSummariesJSON"
+        guard let json = UserDefaults.standard.string(forKey: key),
+              let data = json.data(using: .utf8),
+              var summaries = try? JSONDecoder().decode([RecentSessionSummary].self, from: data) else {
+            return
+        }
+        
+        summaries.removeAll { $0.id == id }
+        if let data = try? JSONEncoder().encode(summaries),
+           let json = String(data: data, encoding: .utf8) {
+            UserDefaults.standard.set(json, forKey: key)
+        }
+    }
+    
+    private func deleteLegacySwiftDataSession(syncID: String) {
+        let descriptor = FetchDescriptor<SleepSession>()
+        guard let sessions = try? modelContext.fetch(descriptor) else { return }
+        sessions
+            .filter { $0.syncID == syncID }
+            .forEach { modelContext.delete($0) }
+        try? modelContext.save()
+    }
 }
 
 // MARK: - Empty State View
@@ -117,12 +152,13 @@ struct EmptyStateView: View {
 // MARK: - Session History List
 struct SessionHistoryList: View {
     let sessions: [SleepSession]
+    let onDelete: (SleepSession) -> Void
     
     var body: some View {
         ScrollView {
             LazyVStack(spacing: 12) {
                 ForEach(sessions) { session in
-                    SessionRowView(session: session)
+                    SessionRowView(session: session, onDelete: onDelete)
                 }
             }
             .padding()
@@ -133,7 +169,9 @@ struct SessionHistoryList: View {
 // MARK: - Session Row View (Expandable)
 struct SessionRowView: View {
     let session: SleepSession
+    let onDelete: (SleepSession) -> Void
     @State private var isExpanded: Bool = false
+    @State private var showDeleteConfirmation = false
     
     var body: some View {
         VStack(spacing: 0) {
@@ -229,21 +267,48 @@ struct SessionRowView: View {
             }
             .buttonStyle(.plain)
             
-            // Expanded check-ins
-            if isExpanded && !session.checkIns.isEmpty {
+            // Expanded check-ins and actions
+            if isExpanded {
                 VStack(spacing: 0) {
-                    ForEach(sortedCheckIns.indices, id: \.self) { index in
-                        let checkIn = sortedCheckIns[index]
-                        CheckInRowView(
-                            checkIn: checkIn,
-                            waitDuration: waitDuration(for: index, in: sortedCheckIns)
-                        )
+                    if !session.checkIns.isEmpty {
+                        ForEach(sortedCheckIns.indices, id: \.self) { index in
+                            let checkIn = sortedCheckIns[index]
+                            CheckInRowView(
+                                checkIn: checkIn,
+                                waitDuration: waitDuration(for: index, in: sortedCheckIns)
+                            )
+                        }
                     }
+                    
+                    Button(role: .destructive) {
+                        showDeleteConfirmation = true
+                    } label: {
+                        Label("Delete Session", systemImage: "trash")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 12)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.red.opacity(0.9))
+                    .padding(.leading, 16)
                 }
                 .padding(.leading, 40)
                 .padding(.trailing, 16)
                 .padding(.top, 8)
             }
+        }
+        .confirmationDialog(
+            "Delete this session?",
+            isPresented: $showDeleteConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Delete Session", role: .destructive) {
+                onDelete(session)
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This removes the session from this device's history.")
         }
     }
     

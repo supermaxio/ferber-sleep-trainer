@@ -333,7 +333,7 @@ final class SessionViewModel {
                 nightNumber: draft.nightNumber,
                 sessionStartTime: draft.startTime,
                 stateStartedAt: currentStateStartTime,
-                intervalSeconds: currentIntervalSeconds,
+                intervalSeconds: Int(intervalForCheckIn(checkInNumber)),
                 checkInNumber: checkInNumber,
                 maxCheckInDuration: maxCheckInDuration,
                 updatedAt: Date()
@@ -363,28 +363,20 @@ final class SessionViewModel {
         maxCheckInDuration = sharedState.maxCheckInDuration
         
         if sharedState.phase == .ended || sharedState.phase == .cancelled {
-            if let currentSession, currentSession.syncID == sharedState.sessionID {
-                currentSession.checkIns.last?.endTime = currentSession.checkIns.last?.endTime ?? sharedState.stateStartedAt
-                currentSession.endTime = sharedState.stateStartedAt
-                currentSession.fellAsleep = sharedState.phase == .ended
-                saveSessionData(modelContext, action: "apply ended shared session")
+            if currentSessionDraft?.syncID == sharedState.sessionID || currentSession?.syncID == sharedState.sessionID {
                 resetSession()
             }
             return
         }
         
-        currentSession = session(for: sharedState, modelContext: modelContext)
+        ensureDraftExists(for: sharedState)
+        currentSession = nil
         sessionSecondsElapsed = max(0, Int(Date().timeIntervalSince(sharedState.sessionStartTime)))
         currentStateStartTime = sharedState.stateStartedAt
         
         switch sharedState.phase {
         case .waiting:
-            if case .checkIn(let previousCheckInNumber) = state,
-               previousCheckInNumber == sharedState.checkInNumber - 1 {
-                currentSession?.checkIns
-                    .first(where: { $0.checkInNumber == previousCheckInNumber && $0.endTime == nil })?
-                    .endTime = sharedState.stateStartedAt
-            }
+            closePreviousDraftCheckInIfNeeded(for: sharedState)
             
             let elapsed = max(0, Int(Date().timeIntervalSince(sharedState.stateStartedAt)))
             state = .waiting(intervalSeconds: sharedState.intervalSeconds, checkInNumber: sharedState.checkInNumber)
@@ -396,13 +388,53 @@ final class SessionViewModel {
             waitingSecondsRemaining = 0
             checkInSecondsElapsed = max(0, Int(Date().timeIntervalSince(sharedState.stateStartedAt)))
             currentCheckInStartTime = sharedState.stateStartedAt
-            ensureCheckInExists(for: sharedState, modelContext: modelContext)
+            ensureDraftCheckInExists(for: sharedState)
         case .ended, .cancelled:
             return
         }
         
-        saveSessionData(modelContext, action: "apply shared session")
         startTimer()
+    }
+    
+    private func ensureDraftExists(for sharedState: SharedActiveSessionState) {
+        guard currentSessionDraft?.syncID != sharedState.sessionID else { return }
+        currentSessionDraft = ActiveSessionDraft(
+            syncID: sharedState.sessionID,
+            nightNumber: sharedState.nightNumber,
+            date: sharedState.sessionStartTime,
+            startTime: sharedState.sessionStartTime
+        )
+    }
+    
+    private func ensureDraftCheckInExists(for sharedState: SharedActiveSessionState) {
+        guard var draft = currentSessionDraft else { return }
+        
+        if let index = draft.checkIns.firstIndex(where: { $0.checkInNumber == sharedState.checkInNumber }) {
+            draft.checkIns[index].timestamp = sharedState.stateStartedAt
+            draft.checkIns[index].intervalMinutes = sharedState.intervalSeconds / 60
+            currentSessionDraft = draft
+            return
+        }
+        
+        draft.checkIns.append(
+            ActiveCheckInDraft(
+                syncID: UUID().uuidString,
+                timestamp: sharedState.stateStartedAt,
+                intervalMinutes: sharedState.intervalSeconds / 60,
+                checkInNumber: sharedState.checkInNumber
+            )
+        )
+        currentSessionDraft = draft
+    }
+    
+    private func closePreviousDraftCheckInIfNeeded(for sharedState: SharedActiveSessionState) {
+        guard var draft = currentSessionDraft else { return }
+        let previousCheckInNumber = sharedState.checkInNumber - 1
+        guard previousCheckInNumber > 0 else { return }
+        guard let index = draft.checkIns.firstIndex(where: { $0.checkInNumber == previousCheckInNumber && $0.endTime == nil }) else { return }
+        
+        draft.checkIns[index].endTime = sharedState.stateStartedAt
+        currentSessionDraft = draft
     }
     
     private func session(for sharedState: SharedActiveSessionState, modelContext: ModelContext) -> SleepSession {
@@ -537,15 +569,28 @@ struct SessionView: View {
             viewModel.maxCheckInDuration = checkInDurationLimit * 60
             viewModel.loadNightConfiguration(modelContext: modelContext)
             refreshLocalSessions()
+            syncHouseholdIfConfigured()
         }
         .task(id: householdCode) {
+            syncHouseholdIfConfigured()
             await pollActiveSessionWhileNeeded()
         }
         .onChange(of: scenePhase) { _, newPhase in
             guard newPhase == .active else { return }
+            refreshLocalSessions()
             Task {
+                syncHouseholdIfConfigured()
                 await refreshActiveSessionFromCloud()
             }
+        }
+        .onChange(of: showSettings) { _, isShowing in
+            guard !isShowing else { return }
+            refreshLocalSessions()
+            syncHouseholdIfConfigured()
+        }
+        .onChange(of: showHistory) { _, isShowing in
+            guard !isShowing else { return }
+            refreshLocalSessions()
         }
         .onChange(of: currentNight) { _, newValue in
             viewModel.currentNight = newValue
@@ -723,8 +768,7 @@ struct SessionView: View {
     }
     
     private var currentNightSessions: [RecentSessionSummary] {
-        let todaysSessions = displayedSessions.filter { Calendar.current.isDateInToday($0.startTime) }
-        return todaysSessions.isEmpty ? displayedSessions : todaysSessions
+        displayedSessions.filter { $0.nightNumber == currentNight }
     }
     
     private var displayedSessions: [RecentSessionSummary] {
@@ -739,7 +783,7 @@ struct SessionView: View {
     private var recentSessionsView: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(currentNightSessions.contains { Calendar.current.isDateInToday($0.startTime) } ? "Today's sessions" : "Recent sessions")
+                Text("Night \(currentNight) sessions")
                     .font(.caption)
                     .fontWeight(.medium)
                     .foregroundStyle(.secondary)
@@ -753,7 +797,7 @@ struct SessionView: View {
             }
             
             if currentNightSessions.isEmpty {
-                Text("No sessions recorded today yet")
+                Text("No sessions recorded for this night yet")
                     .font(.caption2)
                     .foregroundStyle(.secondary.opacity(0.75))
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1041,7 +1085,7 @@ struct SessionView: View {
                 await refreshActiveSessionFromCloud()
             }
             
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
         }
     }
     

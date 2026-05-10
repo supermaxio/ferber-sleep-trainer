@@ -6,7 +6,6 @@ import SwiftData
 final class CloudKitSyncManager {
     static let shared = CloudKitSyncManager()
     
-    private let manifestRecordType = "HouseholdManifest"
     private let recordType = "HouseholdSession"
     private let activeSessionRecordType = "HouseholdActiveSession"
     private let database = CKContainer.default().publicCloudDatabase
@@ -19,7 +18,7 @@ final class CloudKitSyncManager {
             throw CloudKitSyncError.missingHouseholdCode
         }
         
-        let localSessions = try modelContext.fetch(FetchDescriptor<SleepSession>())
+        let localSessions = LocalSessionStore.load().map { $0.makeSleepSession() }
         var localSessionsBySyncID: [String: SleepSession] = [:]
         
         for session in localSessions {
@@ -30,12 +29,8 @@ final class CloudKitSyncManager {
                 localSessionsBySyncID[syncID] = session
             }
         }
-        try modelContext.save()
-        
-        let manifest = try await fetchOrCreateManifest(householdCode: normalizedCode)
-        var manifestSyncIDs = Set(manifest["sessionSyncIDs"] as? [String] ?? [])
-        let remoteRecords = await fetchRemoteSessionRecords(householdCode: normalizedCode, syncIDs: Array(manifestSyncIDs))
-        let remoteSyncIDs = Set(remoteRecords.compactMap { $0["syncID"] as? String })
+        let remoteRecords = try await fetchRemoteSessionRecords(householdCode: normalizedCode)
+        var remoteSyncIDs = Set(remoteRecords.compactMap { $0["syncID"] as? String })
         var importedCount = 0
         var uploadedCount = 0
         
@@ -43,34 +38,29 @@ final class CloudKitSyncManager {
             guard let syncID = record["syncID"] as? String else { continue }
             guard record["endTime"] as? Date != nil else { continue }
             
-            if let localSession = localSessionsBySyncID[syncID] {
-                if localSession.endTime == nil {
-                    try update(localSession, from: record)
-                }
-            } else {
+            if localSessionsBySyncID[syncID] == nil {
                 let session = try session(from: record)
-                modelContext.insert(session)
+                LocalSessionStore.upsert(storedSession(from: session))
+                localSessionsBySyncID[syncID] = session
+                importedCount += 1
             }
-            importedCount += 1
         }
-        
-        try modelContext.save()
         
         for session in localSessions {
             guard let syncID = session.syncID else { continue }
             guard session.endTime != nil else { continue }
+            guard !remoteSyncIDs.contains(syncID) else { continue }
             
-            let record = record(from: session, householdCode: normalizedCode, syncID: syncID)
-            _ = try await database.save(record)
-            manifestSyncIDs.insert(syncID)
-            
-            if !remoteSyncIDs.contains(syncID) {
+            let uploadResult = try await uploadSessionIfNeeded(
+                session,
+                householdCode: normalizedCode,
+                syncID: syncID
+            )
+            if uploadResult == .created {
                 uploadedCount += 1
+                remoteSyncIDs.insert(syncID)
             }
         }
-        
-        manifest["sessionSyncIDs"] = Array(manifestSyncIDs).sorted() as NSArray
-        _ = try await database.save(manifest)
         
         return SyncResult(importedCount: importedCount, uploadedCount: uploadedCount)
     }
@@ -81,24 +71,10 @@ final class CloudKitSyncManager {
             throw CloudKitSyncError.missingHouseholdCode
         }
         
-        let recordID = activeSessionRecordID(householdCode: normalizedCode)
-        let record: CKRecord
-        if let existingRecord = try? await database.record(for: recordID) {
-            record = existingRecord
-        } else {
-            record = CKRecord(recordType: activeSessionRecordType, recordID: recordID)
-        }
-        
-        record["householdCode"] = normalizedCode as NSString
-        record["sessionID"] = activeSession.sessionID as NSString
-        record["phase"] = activeSession.phase.rawValue as NSString
-        record["nightNumber"] = NSNumber(value: activeSession.nightNumber)
-        record["sessionStartTime"] = activeSession.sessionStartTime as NSDate
-        record["stateStartedAt"] = activeSession.stateStartedAt as NSDate
-        record["intervalSeconds"] = NSNumber(value: activeSession.intervalSeconds)
-        record["checkInNumber"] = NSNumber(value: activeSession.checkInNumber)
-        record["maxCheckInDuration"] = NSNumber(value: activeSession.maxCheckInDuration)
-        record["updatedAt"] = activeSession.updatedAt as NSDate
+        let timestamp = Int(activeSession.updatedAt.timeIntervalSince1970 * 1000)
+        let recordID = CKRecord.ID(recordName: "active-\(normalizedCode)-\(activeSession.sessionID)-\(timestamp)-\(UUID().uuidString)")
+        let record = CKRecord(recordType: activeSessionRecordType, recordID: recordID)
+        populateActiveSessionRecord(record, with: activeSession, householdCode: normalizedCode)
         
         _ = try await database.save(record)
     }
@@ -110,10 +86,22 @@ final class CloudKitSyncManager {
         }
         
         do {
-            let record = try await database.record(for: activeSessionRecordID(householdCode: normalizedCode))
-            return try activeSession(from: record)
-        } catch let error as CKError where error.code == .unknownItem {
-            return nil
+            let predicate = NSPredicate(format: "householdCode == %@", normalizedCode)
+            let query = CKQuery(recordType: activeSessionRecordType, predicate: predicate)
+            let result = try await database.records(matching: query, resultsLimit: 100)
+            let records = result.matchResults.compactMap { _, recordResult in
+                try? recordResult.get()
+            }
+            guard let latestRecord = records.max(by: { first, second in
+                let firstDate = first["updatedAt"] as? Date ?? .distantPast
+                let secondDate = second["updatedAt"] as? Date ?? .distantPast
+                return firstDate < secondDate
+            }) else {
+                return nil
+            }
+            return try activeSession(from: latestRecord)
+        } catch {
+            return try await fetchLegacyActiveSession(householdCode: normalizedCode)
         }
     }
     
@@ -130,19 +118,26 @@ final class CloudKitSyncManager {
         }
     }
     
-    private func fetchOrCreateManifest(householdCode: String) async throws -> CKRecord {
-        let recordID = CKRecord.ID(recordName: "household-\(householdCode)")
+    private func fetchRemoteSessionRecords(householdCode: String) async throws -> [CKRecord] {
         do {
-            return try await database.record(for: recordID)
+            let predicate = NSPredicate(format: "householdCode == %@", householdCode)
+            let query = CKQuery(recordType: recordType, predicate: predicate)
+            query.sortDescriptors = [NSSortDescriptor(key: "startTime", ascending: false)]
+            
+            let result = try await database.records(matching: query, resultsLimit: 200)
+            return result.matchResults.compactMap { _, recordResult in
+                try? recordResult.get()
+            }
         } catch {
-            let record = CKRecord(recordType: manifestRecordType, recordID: recordID)
-            record["householdCode"] = householdCode as NSString
-            record["sessionSyncIDs"] = [] as NSArray
-            return record
+            return await fetchRemoteSessionRecordsFromManifest(householdCode: householdCode)
         }
     }
     
-    private func fetchRemoteSessionRecords(householdCode: String, syncIDs: [String]) async -> [CKRecord] {
+    private func fetchRemoteSessionRecordsFromManifest(householdCode: String) async -> [CKRecord] {
+        guard let manifest = try? await database.record(for: CKRecord.ID(recordName: "household-\(householdCode)")) else {
+            return []
+        }
+        let syncIDs = manifest["sessionSyncIDs"] as? [String] ?? []
         var records: [CKRecord] = []
         
         for syncID in syncIDs {
@@ -153,6 +148,28 @@ final class CloudKitSyncManager {
         }
         
         return records
+    }
+    
+    private func fetchLegacyActiveSession(householdCode: String) async throws -> SharedActiveSessionState? {
+        do {
+            let record = try await database.record(for: activeSessionRecordID(householdCode: householdCode))
+            return try activeSession(from: record)
+        } catch let error as CKError where error.code == .unknownItem {
+            return nil
+        }
+    }
+    
+    private func populateActiveSessionRecord(_ record: CKRecord, with activeSession: SharedActiveSessionState, householdCode: String) {
+        record["householdCode"] = householdCode as NSString
+        record["sessionID"] = activeSession.sessionID as NSString
+        record["phase"] = activeSession.phase.rawValue as NSString
+        record["nightNumber"] = NSNumber(value: activeSession.nightNumber)
+        record["sessionStartTime"] = activeSession.sessionStartTime as NSDate
+        record["stateStartedAt"] = activeSession.stateStartedAt as NSDate
+        record["intervalSeconds"] = NSNumber(value: activeSession.intervalSeconds)
+        record["checkInNumber"] = NSNumber(value: activeSession.checkInNumber)
+        record["maxCheckInDuration"] = NSNumber(value: activeSession.maxCheckInDuration)
+        record["updatedAt"] = activeSession.updatedAt as NSDate
     }
     
     private func activeSessionRecordID(householdCode: String) -> CKRecord.ID {
@@ -186,8 +203,20 @@ final class CloudKitSyncManager {
         )
     }
     
-    private func record(from session: SleepSession, householdCode: String, syncID: String) -> CKRecord {
+    private enum SessionUploadResult {
+        case created
+        case alreadyExists
+    }
+    
+    private func uploadSessionIfNeeded(_ session: SleepSession, householdCode: String, syncID: String) async throws -> SessionUploadResult {
         let recordID = CKRecord.ID(recordName: "\(householdCode)-\(syncID)")
+        do {
+            _ = try await database.record(for: recordID)
+            return .alreadyExists
+        } catch let error as CKError {
+            guard error.code == .unknownItem else { throw error }
+        }
+        
         let record = CKRecord(recordType: recordType, recordID: recordID)
         record["householdCode"] = householdCode as NSString
         record["syncID"] = syncID as NSString
@@ -204,7 +233,12 @@ final class CloudKitSyncManager {
             record["notes"] = notes as NSString
         }
         
-        return record
+        do {
+            _ = try await database.save(record)
+            return .created
+        } catch let error as CKError where error.code == .serverRecordChanged || error.code == .batchRequestFailed || error.code == .partialFailure || error.code == .permissionFailure {
+            return .alreadyExists
+        }
     }
     
     private func session(from record: CKRecord) throws -> SleepSession {
@@ -261,6 +295,28 @@ final class CloudKitSyncManager {
                 session.checkIns.append(remoteCheckIn)
             }
         }
+    }
+    
+    private func storedSession(from session: SleepSession) -> StoredSleepSession {
+        StoredSleepSession(
+            syncID: session.syncID ?? UUID().uuidString,
+            nightNumber: session.nightNumber,
+            date: session.date,
+            startTime: session.startTime,
+            endTime: session.endTime,
+            fellAsleep: session.fellAsleep,
+            notes: session.notes,
+            checkIns: session.checkIns.map { checkIn in
+                StoredCheckIn(
+                    syncID: checkIn.syncID ?? UUID().uuidString,
+                    timestamp: checkIn.timestamp,
+                    intervalMinutes: checkIn.intervalMinutes,
+                    checkInNumber: checkIn.checkInNumber,
+                    endTime: checkIn.endTime,
+                    notes: checkIn.notes
+                )
+            }
+        )
     }
     
     private func checkInsJSON(from checkIns: [CheckIn]) -> String {

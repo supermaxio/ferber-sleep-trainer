@@ -223,6 +223,7 @@ struct StoredSleepSession: Codable, Hashable, Identifiable {
 
 enum LocalSessionStore {
     private static let key = "storedSleepSessionsJSON"
+    private static let deletedIDsKey = "deletedSleepSessionSyncIDsJSON"
     
     static func load() -> [StoredSleepSession] {
         guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
@@ -237,6 +238,7 @@ enum LocalSessionStore {
     }
     
     static func upsert(_ session: StoredSleepSession) {
+        guard !isDeleted(syncID: session.syncID) else { return }
         var sessions = load()
         sessions.removeAll { $0.syncID == session.syncID }
         sessions.append(session)
@@ -244,8 +246,62 @@ enum LocalSessionStore {
         print("Local JSON session store count: \(load().count)")
     }
     
+    static func delete(syncID: String) {
+        var sessions = load()
+        sessions.removeAll { $0.syncID == syncID }
+        save(sessions)
+        markDeleted(syncID: syncID)
+    }
+    
+    static func storedSession(from session: SleepSession) -> StoredSleepSession {
+        StoredSleepSession(
+            syncID: session.syncID ?? UUID().uuidString,
+            nightNumber: session.nightNumber,
+            date: session.date,
+            startTime: session.startTime,
+            endTime: session.endTime,
+            fellAsleep: session.fellAsleep,
+            notes: session.notes,
+            checkIns: session.checkIns.map { checkIn in
+                StoredCheckIn(
+                    syncID: checkIn.syncID ?? UUID().uuidString,
+                    timestamp: checkIn.timestamp,
+                    intervalMinutes: checkIn.intervalMinutes,
+                    checkInNumber: checkIn.checkInNumber,
+                    endTime: checkIn.endTime,
+                    notes: checkIn.notes
+                )
+            }
+        )
+    }
+    
     static func clear() {
+        load().forEach { markDeleted(syncID: $0.syncID) }
         UserDefaults.standard.removeObject(forKey: key)
+    }
+    
+    static func isDeleted(syncID: String) -> Bool {
+        deletedSyncIDs().contains(syncID)
+    }
+    
+    private static func markDeleted(syncID: String) {
+        var ids = deletedSyncIDs()
+        ids.insert(syncID)
+        saveDeletedSyncIDs(ids)
+    }
+    
+    private static func deletedSyncIDs() -> Set<String> {
+        guard let data = UserDefaults.standard.data(forKey: deletedIDsKey),
+              let ids = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return Set(ids)
+    }
+    
+    private static func saveDeletedSyncIDs(_ ids: Set<String>) {
+        if let data = try? JSONEncoder().encode(Array(ids)) {
+            UserDefaults.standard.set(data, forKey: deletedIDsKey)
+        }
     }
 }
 
