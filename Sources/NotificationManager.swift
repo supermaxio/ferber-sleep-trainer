@@ -27,6 +27,27 @@ class NotificationManager: ObservableObject {
         }
     }
     
+    @discardableResult
+    func requestPermission() async -> Bool {
+        await requestAuthorization()
+    }
+    
+    func registerCategories() {
+        let checkInCategory = UNNotificationCategory(
+            identifier: "CHECK_IN_REMINDER",
+            actions: [],
+            intentIdentifiers: [],
+            options: []
+        )
+        let leaveRoomCategory = UNNotificationCategory(
+            identifier: "LEAVE_ROOM_REMINDER",
+            actions: [],
+            intentIdentifiers: [],
+            options: []
+        )
+        UNUserNotificationCenter.current().setNotificationCategories([checkInCategory, leaveRoomCategory])
+    }
+    
     func checkAuthorization() async {
         let settings = await UNUserNotificationCenter.current().notificationSettings()
         await MainActor.run {
@@ -40,6 +61,7 @@ class NotificationManager: ObservableObject {
         content.body = "Check #\(checkNumber) - Time to briefly comfort your baby"
         content.sound = .default
         content.interruptionLevel = .timeSensitive
+        content.categoryIdentifier = "CHECK_IN_REMINDER"
         
         let trigger = UNTimeIntervalNotificationTrigger(timeInterval: seconds, repeats: false)
         let request = UNNotificationRequest(identifier: "check-\(checkNumber)-\(Date().timeIntervalSince1970)", content: content, trigger: trigger)
@@ -47,6 +69,24 @@ class NotificationManager: ObservableObject {
         UNUserNotificationCenter.current().add(request) { error in
             if let error = error {
                 print("Failed to schedule notification: \(error)")
+            }
+        }
+    }
+    
+    func scheduleLeaveRoomNotification(afterSeconds seconds: TimeInterval) {
+        let content = UNMutableNotificationContent()
+        content.title = "Time to Leave"
+        content.body = "Wrap up this check-in and leave the room."
+        content.sound = .default
+        content.interruptionLevel = .timeSensitive
+        content.categoryIdentifier = "LEAVE_ROOM_REMINDER"
+        
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: seconds, repeats: false)
+        let request = UNNotificationRequest(identifier: "leave-room-\(Date().timeIntervalSince1970)", content: content, trigger: trigger)
+        
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                print("Failed to schedule leave-room notification: \(error)")
             }
         }
     }

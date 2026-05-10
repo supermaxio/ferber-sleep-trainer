@@ -4,6 +4,7 @@ import SwiftData
 /// Represents a single check-in during a sleep training session
 @Model
 final class CheckIn {
+    var syncID: String?
     var timestamp: Date
     var intervalMinutes: Int // Scheduled interval before this check-in (in minutes)
     var checkInNumber: Int
@@ -12,7 +13,8 @@ final class CheckIn {
     
     var session: SleepSession?
     
-    init(timestamp: Date = Date(), intervalMinutes: Int, checkInNumber: Int, endTime: Date? = nil, notes: String? = nil) {
+    init(syncID: String? = nil, timestamp: Date = Date(), intervalMinutes: Int, checkInNumber: Int, endTime: Date? = nil, notes: String? = nil) {
+        self.syncID = syncID
         self.timestamp = timestamp
         self.intervalMinutes = intervalMinutes
         self.checkInNumber = checkInNumber
@@ -45,6 +47,7 @@ final class CheckIn {
 /// Represents a complete sleep training session (one night)
 @Model
 final class SleepSession {
+    var syncID: String?
     var nightNumber: Int
     var date: Date
     var startTime: Date
@@ -55,7 +58,8 @@ final class SleepSession {
     @Relationship(deleteRule: .cascade, inverse: \CheckIn.session)
     var checkIns: [CheckIn]
     
-    init(nightNumber: Int, date: Date = Date(), startTime: Date = Date(), endTime: Date? = nil, fellAsleep: Bool = false, notes: String? = nil, checkIns: [CheckIn] = []) {
+    init(syncID: String? = nil, nightNumber: Int, date: Date = Date(), startTime: Date = Date(), endTime: Date? = nil, fellAsleep: Bool = false, notes: String? = nil, checkIns: [CheckIn] = []) {
+        self.syncID = syncID
         self.nightNumber = nightNumber
         self.date = date
         self.startTime = startTime
@@ -79,13 +83,18 @@ final class SleepSession {
     /// Formatted total duration string
     var formattedTotalDuration: String {
         guard let duration = totalDurationToSleep else { return "--" }
-        let minutes = Int(duration / 60)
+        let totalSeconds = max(0, Int(duration.rounded()))
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        if totalSeconds < 60 {
+            return "\(totalSeconds) sec"
+        }
         if minutes >= 60 {
             let hours = minutes / 60
             let remainingMinutes = minutes % 60
             return "\(hours)h \(remainingMinutes)m"
         }
-        return "\(minutes) min"
+        return seconds > 0 ? "\(minutes)m \(seconds)s" : "\(minutes) min"
     }
     
     /// Formatted date string
@@ -120,6 +129,179 @@ final class SleepSession {
         let durations = checkIns.compactMap { $0.checkInDuration }
         guard !durations.isEmpty else { return nil }
         return durations.reduce(0, +) / Double(durations.count)
+    }
+}
+
+struct StoredCheckIn: Codable, Hashable {
+    var syncID: String
+    var timestamp: Date
+    var intervalMinutes: Int
+    var checkInNumber: Int
+    var endTime: Date?
+    var notes: String?
+    
+    func makeCheckIn() -> CheckIn {
+        CheckIn(
+            syncID: syncID,
+            timestamp: timestamp,
+            intervalMinutes: intervalMinutes,
+            checkInNumber: checkInNumber,
+            endTime: endTime,
+            notes: notes
+        )
+    }
+}
+
+struct StoredSleepSession: Codable, Hashable, Identifiable {
+    var id: String { syncID }
+    var syncID: String
+    var nightNumber: Int
+    var date: Date
+    var startTime: Date
+    var endTime: Date?
+    var fellAsleep: Bool
+    var notes: String?
+    var checkIns: [StoredCheckIn]
+    
+    var totalDurationToSleep: TimeInterval? {
+        guard let endTime, fellAsleep else { return nil }
+        return endTime.timeIntervalSince(startTime)
+    }
+    
+    var isCompleted: Bool {
+        fellAsleep && endTime != nil
+    }
+    
+    var formattedTotalDuration: String {
+        guard let duration = totalDurationToSleep else { return "--" }
+        let totalSeconds = max(0, Int(duration.rounded()))
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        if totalSeconds < 60 {
+            return "\(totalSeconds) sec"
+        }
+        if minutes >= 60 {
+            return "\(minutes / 60)h \(minutes % 60)m"
+        }
+        return seconds > 0 ? "\(minutes)m \(seconds)s" : "\(minutes) min"
+    }
+    
+    var formattedDate: String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        return formatter.string(from: date)
+    }
+    
+    var formattedStartTime: String {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        return formatter.string(from: startTime)
+    }
+    
+    var formattedEndTime: String {
+        guard let endTime else { return "--" }
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        return formatter.string(from: endTime)
+    }
+    
+    func makeSleepSession() -> SleepSession {
+        let checkInModels = checkIns.map { $0.makeCheckIn() }
+        let session = SleepSession(
+            syncID: syncID,
+            nightNumber: nightNumber,
+            date: date,
+            startTime: startTime,
+            endTime: endTime,
+            fellAsleep: fellAsleep,
+            notes: notes,
+            checkIns: checkInModels
+        )
+        return session
+    }
+}
+
+enum LocalSessionStore {
+    private static let key = "storedSleepSessionsJSON"
+    private static let deletedIDsKey = "deletedSleepSessionSyncIDsJSON"
+    
+    static func load() -> [StoredSleepSession] {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+        return (try? JSONDecoder().decode([StoredSleepSession].self, from: data)) ?? []
+    }
+    
+    static func save(_ sessions: [StoredSleepSession]) {
+        let sortedSessions = sessions.sorted { $0.startTime > $1.startTime }
+        if let data = try? JSONEncoder().encode(sortedSessions) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+    
+    static func upsert(_ session: StoredSleepSession) {
+        guard !isDeleted(syncID: session.syncID) else { return }
+        var sessions = load()
+        sessions.removeAll { $0.syncID == session.syncID }
+        sessions.append(session)
+        save(sessions)
+        print("Local JSON session store count: \(load().count)")
+    }
+    
+    static func delete(syncID: String) {
+        var sessions = load()
+        sessions.removeAll { $0.syncID == syncID }
+        save(sessions)
+        markDeleted(syncID: syncID)
+    }
+    
+    static func storedSession(from session: SleepSession) -> StoredSleepSession {
+        StoredSleepSession(
+            syncID: session.syncID ?? UUID().uuidString,
+            nightNumber: session.nightNumber,
+            date: session.date,
+            startTime: session.startTime,
+            endTime: session.endTime,
+            fellAsleep: session.fellAsleep,
+            notes: session.notes,
+            checkIns: session.checkIns.map { checkIn in
+                StoredCheckIn(
+                    syncID: checkIn.syncID ?? UUID().uuidString,
+                    timestamp: checkIn.timestamp,
+                    intervalMinutes: checkIn.intervalMinutes,
+                    checkInNumber: checkIn.checkInNumber,
+                    endTime: checkIn.endTime,
+                    notes: checkIn.notes
+                )
+            }
+        )
+    }
+    
+    static func clear() {
+        load().forEach { markDeleted(syncID: $0.syncID) }
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+    
+    static func isDeleted(syncID: String) -> Bool {
+        deletedSyncIDs().contains(syncID)
+    }
+    
+    private static func markDeleted(syncID: String) {
+        var ids = deletedSyncIDs()
+        ids.insert(syncID)
+        saveDeletedSyncIDs(ids)
+    }
+    
+    private static func deletedSyncIDs() -> Set<String> {
+        guard let data = UserDefaults.standard.data(forKey: deletedIDsKey),
+              let ids = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return Set(ids)
+    }
+    
+    private static func saveDeletedSyncIDs(_ ids: Set<String>) {
+        if let data = try? JSONEncoder().encode(Array(ids)) {
+            UserDefaults.standard.set(data, forKey: deletedIDsKey)
+        }
     }
 }
 

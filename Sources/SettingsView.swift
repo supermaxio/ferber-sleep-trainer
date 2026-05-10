@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import UniformTypeIdentifiers
 
 // MARK: - Settings View
 
@@ -9,7 +10,8 @@ struct SettingsView: View {
     
     // Simple preferences with @AppStorage
     @AppStorage("currentNight") private var currentNight: Int = 1
-    @AppStorage("checkInDurationLimit") private var checkInDurationLimit: Int = 120
+    @AppStorage("checkInDurationLimit") private var checkInDurationLimit: Int = 2
+    @AppStorage("householdCode") private var householdCode: String = ""
     
     // SwiftData night configurations
     @Query(sort: \NightConfiguration.nightNumber) private var nightConfigurations: [NightConfiguration]
@@ -17,7 +19,13 @@ struct SettingsView: View {
     // Local state
     @State private var showResetConfirmation = false
     @State private var showClearHistoryConfirmation = false
+    @State private var showImportHistory = false
+    @State private var showTemplateExporter = false
+    @State private var showImportResult = false
+    @State private var isSyncingHousehold = false
     @State private var selectedNight: NightConfiguration?
+    @State private var importResultTitle = ""
+    @State private var importResultMessage = ""
     
     var body: some View {
         NavigationStack {
@@ -51,17 +59,17 @@ struct SettingsView: View {
                     
                     // MARK: - Check-In Duration Section
                     Section {
-                        Stepper(value: $checkInDurationLimit, in: 60...180, step: 15) {
+                        Stepper(value: $checkInDurationLimit, in: 1...40) {
                             HStack {
                                 Image(systemName: "timer")
                                     .foregroundStyle(.teal)
-                                Text("\(checkInDurationLimit) seconds")
+                                Text("\(checkInDurationLimit) minute\(checkInDurationLimit == 1 ? "" : "s")")
                                     .foregroundColor(.white)
                             }
                         }
                         .accessibilityLabel("Check-in duration limit")
-                        .accessibilityValue("\(checkInDurationLimit) seconds")
-                        .accessibilityHint("Adjust from 60 to 180 seconds")
+                        .accessibilityValue("\(checkInDurationLimit) minute\(checkInDurationLimit == 1 ? "" : "s")")
+                        .accessibilityHint("Adjust from 1 to 40 minutes")
                     } header: {
                         Text("Check-In Duration Limit")
                             .foregroundColor(.gray)
@@ -121,8 +129,75 @@ struct SettingsView: View {
                     }
                     .listRowBackground(Color(white: 0.12))
                     
+                    // MARK: - Household Sync Section
+                    Section {
+                        HStack {
+                            Image(systemName: "person.2.fill")
+                                .foregroundStyle(.indigo)
+                            TextField("Household code", text: $householdCode)
+                                .textInputAutocapitalization(.characters)
+                                .autocorrectionDisabled()
+                                .foregroundColor(.white)
+                                .monospaced()
+                        }
+                        
+                        Button {
+                            createHouseholdCode()
+                        } label: {
+                            HStack {
+                                Image(systemName: "plus.circle")
+                                    .foregroundStyle(.blue)
+                                Text(householdCode.isEmpty ? "Create Household Code" : "Create New Household Code")
+                                    .foregroundColor(.white)
+                            }
+                        }
+                        
+                        Button {
+                            syncHousehold()
+                        } label: {
+                            HStack {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                                    .foregroundStyle(.teal)
+                                Text(isSyncingHousehold ? "Syncing..." : "Sync Household Data")
+                                    .foregroundColor(.white)
+                            }
+                        }
+                        .disabled(isSyncingHousehold || householdCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    } header: {
+                        Text("Household Sync")
+                            .foregroundColor(.gray)
+                    } footer: {
+                        Text("Use the same household code on both phones, then sync. This uses iCloud CloudKit and requires both phones to be signed into iCloud.")
+                            .foregroundColor(.gray)
+                    }
+                    .listRowBackground(Color(white: 0.12))
+                    
                     // MARK: - Clear History Section
                     Section {
+                        Button {
+                            showTemplateExporter = true
+                        } label: {
+                            HStack {
+                                Image(systemName: "square.and.arrow.down")
+                                    .foregroundStyle(.blue)
+                                Text("Save Import Template")
+                                    .foregroundColor(.white)
+                            }
+                        }
+                        .accessibilityLabel("Save history import template")
+                        
+                        Button {
+                            showImportHistory = true
+                        } label: {
+                            HStack {
+                                Image(systemName: "square.and.arrow.down.on.square")
+                                    .foregroundStyle(.teal)
+                                Text("Import History CSV")
+                                    .foregroundColor(.white)
+                            }
+                        }
+                        .accessibilityLabel("Import history from CSV")
+                        
                         Button(role: .destructive) {
                             showClearHistoryConfirmation = true
                         } label: {
@@ -137,7 +212,7 @@ struct SettingsView: View {
                         Text("Data")
                             .foregroundColor(.gray)
                     } footer: {
-                        Text("This permanently deletes all sleep training session history. This action cannot be undone.")
+                        Text("Save the template, fill it in, then import it from Files. Check-ins use wait minutes/check-in seconds, for example 3/45;5/30. Clearing history permanently deletes all sessions.")
                             .foregroundColor(.gray)
                     }
                     .listRowBackground(Color(white: 0.12))
@@ -207,7 +282,33 @@ struct SettingsView: View {
             } message: {
                 Text("This will permanently delete all sleep training session data. This cannot be undone.")
             }
+            .alert(importResultTitle, isPresented: $showImportResult) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text(importResultMessage)
+            }
+            .fileExporter(
+                isPresented: $showTemplateExporter,
+                document: HistoryImportTemplateDocument(),
+                contentType: .commaSeparatedText,
+                defaultFilename: "Comfy-Night-History-Template"
+            ) { result in
+                if case .failure(let error) = result {
+                    showImportResult(
+                        title: "Template Export Failed",
+                        message: error.localizedDescription
+                    )
+                }
+            }
+            .fileImporter(
+                isPresented: $showImportHistory,
+                allowedContentTypes: [.commaSeparatedText, .plainText],
+                allowsMultipleSelection: false
+            ) { result in
+                importHistory(from: result)
+            }
             .onAppear {
+                migrateCheckInDurationLimitToMinutes()
                 ensureNightConfigurationsExist()
             }
         }
@@ -227,6 +328,13 @@ struct SettingsView: View {
     private func formatIntervals(_ config: NightConfiguration) -> String {
         let intervals = config.intervals
         return intervals.dropLast().map { "\($0)" }.joined(separator: ", ") + ", \(intervals.last ?? 0)+ min"
+    }
+    
+    /// Convert older saved second-based values to minutes.
+    private func migrateCheckInDurationLimitToMinutes() {
+        if checkInDurationLimit > 40 {
+            checkInDurationLimit = min(max(checkInDurationLimit / 60, 1), 40)
+        }
     }
     
     /// Ensure night configurations exist in SwiftData
@@ -257,6 +365,9 @@ struct SettingsView: View {
     
     /// Clear all session history
     private func clearAllHistory() {
+        LocalSessionStore.clear()
+        UserDefaults.standard.removeObject(forKey: "recentSessionSummariesJSON")
+        
         // Fetch and delete all sessions (CheckIns are cascade deleted)
         let descriptor = FetchDescriptor<SleepSession>()
         if let sessions = try? modelContext.fetch(descriptor) {
@@ -269,6 +380,278 @@ struct SettingsView: View {
         currentNight = 1
         
         try? modelContext.save()
+    }
+    
+    private func createHouseholdCode() {
+        let characters = Array("ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
+        householdCode = String((0..<8).compactMap { _ in characters.randomElement() })
+    }
+    
+    private func syncHousehold() {
+        let code = householdCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        householdCode = code
+        isSyncingHousehold = true
+        
+        Task {
+            do {
+                let result = try await CloudKitSyncManager.shared.sync(
+                    householdCode: code,
+                    modelContext: modelContext
+                )
+                showImportResult(
+                    title: "Sync Complete",
+                    message: "Uploaded \(result.uploadedCount) session\(result.uploadedCount == 1 ? "" : "s") and imported \(result.importedCount) session\(result.importedCount == 1 ? "" : "s")."
+                )
+            } catch {
+                showImportResult(
+                    title: "Sync Failed",
+                    message: error.localizedDescription
+                )
+            }
+            
+            isSyncingHousehold = false
+        }
+    }
+    
+    private func importHistory(from result: Result<[URL], Error>) {
+        do {
+            guard let url = try result.get().first else { return }
+            let didAccess = url.startAccessingSecurityScopedResource()
+            defer {
+                if didAccess {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            
+            let csv = try String(contentsOf: url, encoding: .utf8)
+            let importedSessions = try HistoryCSVImporter.importSessions(from: csv)
+            
+            for session in importedSessions {
+                LocalSessionStore.upsert(LocalSessionStore.storedSession(from: session))
+            }
+            
+            syncHouseholdSilentlyIfConfigured()
+            showImportResult(
+                title: "Import Complete",
+                message: "Imported \(importedSessions.count) session\(importedSessions.count == 1 ? "" : "s")."
+            )
+        } catch {
+            showImportResult(
+                title: "Import Failed",
+                message: error.localizedDescription
+            )
+        }
+    }
+    
+    private func showImportResult(title: String, message: String) {
+        importResultTitle = title
+        importResultMessage = message
+        showImportResult = true
+    }
+    
+    private func syncHouseholdSilentlyIfConfigured() {
+        let code = householdCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !code.isEmpty else { return }
+        
+        Task {
+            try? await CloudKitSyncManager.shared.sync(
+                householdCode: code,
+                modelContext: modelContext
+            )
+        }
+    }
+}
+
+struct HistoryImportTemplateDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.commaSeparatedText] }
+    
+    init() { }
+    
+    init(configuration: ReadConfiguration) throws { }
+    
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: Data(Self.template.utf8))
+    }
+    
+    private static let template = """
+    night,date,start_time,end_time,fell_asleep,check_ins
+    1,2026-05-10,19:30,20:15,true,3/45;5/30;10/40
+    1,2026-05-10,23:00,23:08,true,3/45;5/30
+    1,2026-05-11,00:20,00:32,true,3/45;5/30;10/40
+    1,2026-05-11,04:02,04:45,true,3/45;5/30;10/40;10/40
+    2,2026-05-11,19:45,20:10,false,5/60;10/45
+    
+    """
+}
+
+enum HistoryCSVImportError: LocalizedError {
+    case emptyFile
+    case invalidHeader
+    case invalidRow(line: Int, reason: String)
+    
+    var errorDescription: String? {
+        switch self {
+        case .emptyFile:
+            return "The CSV file is empty."
+        case .invalidHeader:
+            return "The CSV header must be: night,date,start_time,end_time,fell_asleep,check_ins"
+        case .invalidRow(let line, let reason):
+            return "Line \(line): \(reason)"
+        }
+    }
+}
+
+struct HistoryCSVImporter {
+    static func importSessions(from csv: String) throws -> [SleepSession] {
+        let rows = parseRows(csv)
+            .filter { row in
+                row.contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            }
+        
+        guard !rows.isEmpty else {
+            throw HistoryCSVImportError.emptyFile
+        }
+        
+        let expectedHeader = ["night", "date", "start_time", "end_time", "fell_asleep", "check_ins"]
+        let header = rows[0].map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        guard header == expectedHeader else {
+            throw HistoryCSVImportError.invalidHeader
+        }
+        
+        return try rows.dropFirst().enumerated().map { index, row in
+            try importSession(from: row, line: index + 2)
+        }
+    }
+    
+    private static func importSession(from row: [String], line: Int) throws -> SleepSession {
+        guard row.count == 6 else {
+            throw HistoryCSVImportError.invalidRow(line: line, reason: "Expected 6 columns.")
+        }
+        
+        let nightText = trimmed(row[0])
+        let dateText = trimmed(row[1])
+        let startTimeText = trimmed(row[2])
+        let endTimeText = trimmed(row[3])
+        let fellAsleepText = trimmed(row[4]).lowercased()
+        let checkInsText = trimmed(row[5])
+        
+        guard let nightNumber = Int(nightText), (1...7).contains(nightNumber) else {
+            throw HistoryCSVImportError.invalidRow(line: line, reason: "Night must be a number from 1 to 7.")
+        }
+        
+        guard let startTime = makeDate(date: dateText, time: startTimeText) else {
+            throw HistoryCSVImportError.invalidRow(line: line, reason: "Date and start_time must use YYYY-MM-DD and HH:mm.")
+        }
+        
+        let explicitEndTime = makeDate(date: dateText, time: endTimeText)
+        let fellAsleep = ["true", "yes", "y", "1"].contains(fellAsleepText)
+        var cursor = startTime
+        var checkIns: [CheckIn] = []
+        
+        if !checkInsText.isEmpty {
+            let entries = checkInsText.split(separator: ";").map(String.init)
+            for (entryIndex, entry) in entries.enumerated() {
+                let parts = entry.split(separator: "/").map { trimmed(String($0)) }
+                guard parts.count == 2,
+                      let waitMinutes = Int(parts[0]),
+                      let checkInSeconds = Int(parts[1]),
+                      waitMinutes >= 0,
+                      checkInSeconds >= 0 else {
+                    throw HistoryCSVImportError.invalidRow(
+                        line: line,
+                        reason: "Check-ins must use waitMinutes/checkInSeconds, like 3/45;5/30."
+                    )
+                }
+                
+                let checkInStart = cursor.addingTimeInterval(TimeInterval(waitMinutes * 60))
+                let checkInEnd = checkInStart.addingTimeInterval(TimeInterval(checkInSeconds))
+                let checkIn = CheckIn(
+                    timestamp: checkInStart,
+                    intervalMinutes: waitMinutes,
+                    checkInNumber: entryIndex + 1,
+                    endTime: checkInEnd
+                )
+                checkIns.append(checkIn)
+                cursor = checkInEnd
+            }
+        }
+        
+        let sessionEndTime = explicitEndTime ?? (fellAsleep ? cursor : nil)
+        let session = SleepSession(
+            syncID: UUID().uuidString,
+            nightNumber: nightNumber,
+            date: startTime,
+            startTime: startTime,
+            endTime: sessionEndTime,
+            fellAsleep: fellAsleep,
+            checkIns: checkIns
+        )
+        
+        return session
+    }
+    
+    private static func parseRows(_ csv: String) -> [[String]] {
+        var rows: [[String]] = []
+        var row: [String] = []
+        var field = ""
+        var isQuoted = false
+        var iterator = csv.makeIterator()
+        
+        while let character = iterator.next() {
+            switch character {
+            case "\"":
+                if isQuoted, let next = iterator.next() {
+                    if next == "\"" {
+                        field.append(next)
+                    } else {
+                        isQuoted = false
+                        if next == "," {
+                            row.append(field)
+                            field = ""
+                        } else if next == "\n" {
+                            row.append(field)
+                            rows.append(row)
+                            row = []
+                            field = ""
+                        } else if next != "\r" {
+                            field.append(next)
+                        }
+                    }
+                } else {
+                    isQuoted.toggle()
+                }
+            case "," where !isQuoted:
+                row.append(field)
+                field = ""
+            case "\n" where !isQuoted:
+                row.append(field)
+                rows.append(row)
+                row = []
+                field = ""
+            case "\r":
+                break
+            default:
+                field.append(character)
+            }
+        }
+        
+        if !field.isEmpty || !row.isEmpty {
+            row.append(field)
+            rows.append(row)
+        }
+        
+        return rows
+    }
+    
+    private static func makeDate(date: String, time: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        return formatter.date(from: "\(date) \(time)")
+    }
+    
+    private static func trimmed(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
