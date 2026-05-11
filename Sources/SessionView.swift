@@ -48,11 +48,15 @@ final class SessionViewModel {
     var currentCheckInStartTime: Date?
     var currentStateStartTime: Date?
     
-    // Timer values
+    // Timer values (computed from wall clock on each tick)
     var waitingSecondsRemaining: Int = 0
     var checkInSecondsElapsed: Int = 0
     var sessionSecondsElapsed: Int = 0
     var waitingPaused: Bool = false
+    
+    // Wall clock anchors for accurate background timing
+    private var waitingResumedAt: Date?
+    private var waitingSecondsAtResume: Int = 0
     
     // Configuration
     var currentNight: Int = 1
@@ -171,6 +175,8 @@ final class SessionViewModel {
     private func startWaiting(intervalSeconds: Int, checkInNumber: Int) {
         state = .waiting(intervalSeconds: intervalSeconds, checkInNumber: checkInNumber)
         waitingSecondsRemaining = intervalSeconds
+        waitingSecondsAtResume = intervalSeconds
+        waitingResumedAt = Date()
         checkInSecondsElapsed = 0
         currentStateStartTime = Date()
     }
@@ -208,6 +214,7 @@ final class SessionViewModel {
         
         startWaiting(intervalSeconds: nextIntervalSeconds, checkInNumber: nextCheckInNumber)
         waitingPaused = true
+        waitingResumedAt = nil
         
         if let lastIndex = currentSessionDraft?.checkIns.indices.last {
             currentSessionDraft?.checkIns[lastIndex].endTime = Date()
@@ -221,6 +228,8 @@ final class SessionViewModel {
     func resumeWaiting() {
         guard case .waiting(_, let checkInNumber) = state else { return }
         waitingPaused = false
+        waitingResumedAt = Date()
+        waitingSecondsAtResume = waitingSecondsRemaining
         currentStateStartTime = Date()
         
         NotificationManager.shared.scheduleCheckNotification(afterSeconds: TimeInterval(waitingSecondsRemaining), checkNumber: checkInNumber)
@@ -228,18 +237,68 @@ final class SessionViewModel {
     
     func pauseWaiting() {
         guard case .waiting = state else { return }
+        recalculateFromWallClock()
         waitingPaused = true
+        waitingResumedAt = nil
         NotificationManager.shared.cancelAllNotifications()
+    }
+    
+    func goBackFromCheckIn() {
+        guard case .checkIn(let checkInNumber) = state else { return }
+        
+        let intervalSeconds = Int(intervalForCheckIn(checkInNumber))
+        state = .waiting(intervalSeconds: intervalSeconds, checkInNumber: checkInNumber)
+        waitingPaused = true
+        waitingResumedAt = nil
+        waitingSecondsRemaining = intervalSeconds
+        waitingSecondsAtResume = intervalSeconds
+        checkInSecondsElapsed = 0
+        currentCheckInStartTime = nil
+        currentStateStartTime = Date()
+        
+        if let lastIndex = currentSessionDraft?.checkIns.indices.last {
+            currentSessionDraft?.checkIns.remove(at: lastIndex)
+        }
+        
+        NotificationManager.shared.cancelAllNotifications()
+    }
+    
+    func cancelSessionSilently() {
+        stopTimer()
+        resetSession()
+    }
+    
+    func goBackFromWaiting() {
+        guard case .waiting(_, let checkInNumber) = state, checkInNumber > 1 else { return }
+        
+        let previousCheckInNumber = checkInNumber - 1
+        state = .checkIn(checkInNumber: previousCheckInNumber)
+        checkInSecondsElapsed = 0
+        waitingSecondsRemaining = 0
+        waitingPaused = false
+        currentCheckInStartTime = Date()
+        currentStateStartTime = currentCheckInStartTime
+        
+        if let lastIndex = currentSessionDraft?.checkIns.indices.last {
+            currentSessionDraft?.checkIns[lastIndex].endTime = nil
+        }
+        
+        NotificationManager.shared.cancelAllNotifications()
+        NotificationManager.shared.scheduleLeaveRoomNotification(afterSeconds: TimeInterval(maxCheckInDuration))
     }
     
     func restartWaiting() {
         guard case .waiting(let intervalSeconds, let checkInNumber) = state else { return }
         waitingSecondsRemaining = intervalSeconds
+        waitingSecondsAtResume = intervalSeconds
         currentStateStartTime = Date()
         
         if !waitingPaused {
+            waitingResumedAt = Date()
             NotificationManager.shared.cancelAllNotifications()
             NotificationManager.shared.scheduleCheckNotification(afterSeconds: TimeInterval(intervalSeconds), checkNumber: checkInNumber)
+        } else {
+            waitingResumedAt = nil
         }
     }
     
@@ -299,6 +358,8 @@ final class SessionViewModel {
         checkInSecondsElapsed = 0
         sessionSecondsElapsed = 0
         waitingPaused = false
+        waitingResumedAt = nil
+        waitingSecondsAtResume = 0
         
         // Cancel all pending notifications when session ends
         NotificationManager.shared.cancelAllNotifications()
@@ -310,7 +371,7 @@ final class SessionViewModel {
         timerCancellable = Timer.publish(every: 1, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
-                self?.tick()
+                self?.recalculateFromWallClock()
             }
     }
     
@@ -319,18 +380,25 @@ final class SessionViewModel {
         timerCancellable = nil
     }
     
-    private func tick() {
-        sessionSecondsElapsed += 1
+    func recalculateFromWallClock() {
+        let now = Date()
+        
+        if let sessionStart = currentSessionDraft?.startTime ?? currentSession?.startTime {
+            sessionSecondsElapsed = max(0, Int(now.timeIntervalSince(sessionStart)))
+        }
         
         switch state {
         case .idle:
             break
         case .waiting:
-            if !waitingPaused && waitingSecondsRemaining > 0 {
-                waitingSecondsRemaining -= 1
+            if !waitingPaused, let resumedAt = waitingResumedAt {
+                let elapsed = max(0, Int(now.timeIntervalSince(resumedAt)))
+                waitingSecondsRemaining = max(0, waitingSecondsAtResume - elapsed)
             }
         case .checkIn:
-            checkInSecondsElapsed += 1
+            if let stateStart = currentStateStartTime {
+                checkInSecondsElapsed = max(0, Int(now.timeIntervalSince(stateStart)))
+            }
         }
     }
     
@@ -604,6 +672,7 @@ struct SessionView: View {
         }
         .onChange(of: scenePhase) { _, newPhase in
             guard newPhase == .active else { return }
+            viewModel.recalculateFromWallClock()
             refreshLocalSessions()
             Task {
                 syncHouseholdIfConfigured()
@@ -941,6 +1010,23 @@ struct SessionView: View {
                 // Timer controls
                 HStack(spacing: 32) {
                     Button {
+                        if checkInNumber == 1 {
+                            let cancelledState = viewModel.makeSharedEndedSessionState(phase: .cancelled)
+                            viewModel.cancelSessionSilently()
+                            refreshLocalSessions()
+                            publishActiveSessionState(cancelledState)
+                        } else {
+                            viewModel.goBackFromWaiting()
+                            publishActiveSessionState()
+                        }
+                    } label: {
+                        Image(systemName: "chevron.backward")
+                            .font(.body)
+                            .foregroundStyle(.orange.opacity(0.5))
+                    }
+                    .buttonStyle(.plain)
+                    
+                    Button {
                         viewModel.restartWaiting()
                         publishActiveSessionState()
                     } label: {
@@ -1038,6 +1124,16 @@ struct SessionView: View {
                     .monospacedDigit()
                     .contentTransition(.numericText())
                     .animation(.linear(duration: 0.1), value: viewModel.checkInSecondsElapsed)
+                
+                Button {
+                    viewModel.goBackFromCheckIn()
+                    publishActiveSessionState()
+                } label: {
+                    Image(systemName: "chevron.backward")
+                        .font(.body)
+                        .foregroundStyle(.teal.opacity(0.5))
+                }
+                .buttonStyle(.plain)
                 
                 // Progress indicator
                 ProgressView(value: viewModel.checkInProgress)
