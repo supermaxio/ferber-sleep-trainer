@@ -52,6 +52,7 @@ final class SessionViewModel {
     var waitingSecondsRemaining: Int = 0
     var checkInSecondsElapsed: Int = 0
     var sessionSecondsElapsed: Int = 0
+    var waitingPaused: Bool = false
     
     // Configuration
     var currentNight: Int = 1
@@ -206,6 +207,7 @@ final class SessionViewModel {
         let nextIntervalSeconds = Int(intervalForCheckIn(nextCheckInNumber))
         
         startWaiting(intervalSeconds: nextIntervalSeconds, checkInNumber: nextCheckInNumber)
+        waitingPaused = true
         
         if let lastIndex = currentSessionDraft?.checkIns.indices.last {
             currentSessionDraft?.checkIns[lastIndex].endTime = Date()
@@ -213,8 +215,32 @@ final class SessionViewModel {
             currentSession?.checkIns.last?.endTime = Date()
         }
         
-        // Schedule next check-in notification
-        NotificationManager.shared.scheduleCheckNotification(afterSeconds: TimeInterval(nextIntervalSeconds), checkNumber: nextCheckInNumber)
+        NotificationManager.shared.cancelAllNotifications()
+    }
+    
+    func resumeWaiting() {
+        guard case .waiting(_, let checkInNumber) = state else { return }
+        waitingPaused = false
+        currentStateStartTime = Date()
+        
+        NotificationManager.shared.scheduleCheckNotification(afterSeconds: TimeInterval(waitingSecondsRemaining), checkNumber: checkInNumber)
+    }
+    
+    func pauseWaiting() {
+        guard case .waiting = state else { return }
+        waitingPaused = true
+        NotificationManager.shared.cancelAllNotifications()
+    }
+    
+    func restartWaiting() {
+        guard case .waiting(let intervalSeconds, let checkInNumber) = state else { return }
+        waitingSecondsRemaining = intervalSeconds
+        currentStateStartTime = Date()
+        
+        if !waitingPaused {
+            NotificationManager.shared.cancelAllNotifications()
+            NotificationManager.shared.scheduleCheckNotification(afterSeconds: TimeInterval(intervalSeconds), checkNumber: checkInNumber)
+        }
     }
     
     func finishSessionDraft(fellAsleep: Bool) -> CompletedSessionDraft? {
@@ -272,6 +298,7 @@ final class SessionViewModel {
         waitingSecondsRemaining = 0
         checkInSecondsElapsed = 0
         sessionSecondsElapsed = 0
+        waitingPaused = false
         
         // Cancel all pending notifications when session ends
         NotificationManager.shared.cancelAllNotifications()
@@ -299,7 +326,7 @@ final class SessionViewModel {
         case .idle:
             break
         case .waiting:
-            if waitingSecondsRemaining > 0 {
+            if !waitingPaused && waitingSecondsRemaining > 0 {
                 waitingSecondsRemaining -= 1
             }
         case .checkIn:
@@ -898,7 +925,7 @@ struct SessionView: View {
     private func waitingView(_ checkInNumber: Int) -> some View {
         VStack(spacing: 24) {
                 // Status label
-                Label("Waiting", systemImage: "hourglass")
+                Label(viewModel.waitingPaused ? "Paused" : "Waiting", systemImage: viewModel.waitingPaused ? "pause.circle" : "hourglass")
                     .font(.subheadline)
                     .fontWeight(.medium)
                     .foregroundStyle(.orange.opacity(0.8))
@@ -906,10 +933,37 @@ struct SessionView: View {
                 // Main countdown timer
                 Text(viewModel.formattedWaitingTime)
                     .font(.system(size: 96, weight: .light, design: .rounded))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(viewModel.waitingPaused ? .white.opacity(0.4) : .white)
                     .monospacedDigit()
                     .contentTransition(.numericText())
                     .animation(.linear(duration: 0.1), value: viewModel.waitingSecondsRemaining)
+                
+                // Timer controls
+                HStack(spacing: 32) {
+                    Button {
+                        viewModel.restartWaiting()
+                        publishActiveSessionState()
+                    } label: {
+                        Image(systemName: "arrow.counterclockwise")
+                            .font(.body)
+                            .foregroundStyle(.orange.opacity(0.5))
+                    }
+                    .buttonStyle(.plain)
+                    
+                    Button {
+                        if viewModel.waitingPaused {
+                            viewModel.resumeWaiting()
+                        } else {
+                            viewModel.pauseWaiting()
+                        }
+                        publishActiveSessionState()
+                    } label: {
+                        Image(systemName: viewModel.waitingPaused ? "play.fill" : "pause.fill")
+                            .font(.body)
+                            .foregroundStyle(.orange.opacity(0.5))
+                    }
+                    .buttonStyle(.plain)
+                }
                 
                 // Progress ring
                 ZStack {
