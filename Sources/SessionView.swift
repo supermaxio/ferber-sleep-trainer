@@ -419,6 +419,8 @@ final class SessionViewModel {
                 intervalSeconds: intervalSeconds,
                 checkInNumber: checkInNumber,
                 maxCheckInDuration: maxCheckInDuration,
+                waitingPaused: waitingPaused,
+                waitingSecondsRemaining: waitingSecondsRemaining,
                 updatedAt: Date()
             )
         case .checkIn(let checkInNumber):
@@ -431,6 +433,8 @@ final class SessionViewModel {
                 intervalSeconds: Int(intervalForCheckIn(checkInNumber)),
                 checkInNumber: checkInNumber,
                 maxCheckInDuration: maxCheckInDuration,
+                waitingPaused: false,
+                waitingSecondsRemaining: 0,
                 updatedAt: Date()
             )
         }
@@ -449,6 +453,8 @@ final class SessionViewModel {
             intervalSeconds: 0,
             checkInNumber: checkInCount + 1,
             maxCheckInDuration: maxCheckInDuration,
+            waitingPaused: false,
+            waitingSecondsRemaining: 0,
             updatedAt: Date()
         )
     }
@@ -473,11 +479,21 @@ final class SessionViewModel {
         case .waiting:
             closePreviousDraftCheckInIfNeeded(for: sharedState)
             
-            let elapsed = max(0, Int(Date().timeIntervalSince(sharedState.stateStartedAt)))
             state = .waiting(intervalSeconds: sharedState.intervalSeconds, checkInNumber: sharedState.checkInNumber)
-            waitingSecondsRemaining = max(0, sharedState.intervalSeconds - elapsed)
             checkInSecondsElapsed = 0
             currentCheckInStartTime = nil
+            waitingPaused = sharedState.waitingPaused
+            
+            if sharedState.waitingPaused {
+                waitingSecondsRemaining = sharedState.waitingSecondsRemaining
+                waitingResumedAt = nil
+                waitingSecondsAtResume = sharedState.waitingSecondsRemaining
+            } else {
+                let elapsed = max(0, Int(Date().timeIntervalSince(sharedState.stateStartedAt)))
+                waitingSecondsRemaining = max(0, sharedState.waitingSecondsRemaining - elapsed)
+                waitingResumedAt = sharedState.stateStartedAt
+                waitingSecondsAtResume = sharedState.waitingSecondsRemaining
+            }
         case .checkIn:
             state = .checkIn(checkInNumber: sharedState.checkInNumber)
             waitingSecondsRemaining = 0

@@ -169,6 +169,8 @@ final class CloudKitSyncManager {
         record["intervalSeconds"] = NSNumber(value: activeSession.intervalSeconds)
         record["checkInNumber"] = NSNumber(value: activeSession.checkInNumber)
         record["maxCheckInDuration"] = NSNumber(value: activeSession.maxCheckInDuration)
+        record["waitingPaused"] = NSNumber(value: activeSession.waitingPaused)
+        record["waitingSecondsRemaining"] = NSNumber(value: activeSession.waitingSecondsRemaining)
         record["updatedAt"] = activeSession.updatedAt as NSDate
     }
     
@@ -190,6 +192,9 @@ final class CloudKitSyncManager {
             throw CloudKitSyncError.invalidRecord
         }
         
+        let waitingPaused = boolValue(for: "waitingPaused", in: record)
+        let waitingSecondsRemaining = intValue(for: "waitingSecondsRemaining", in: record) ?? 0
+        
         return SharedActiveSessionState(
             sessionID: sessionID,
             phase: phase,
@@ -199,6 +204,8 @@ final class CloudKitSyncManager {
             intervalSeconds: intervalSeconds,
             checkInNumber: checkInNumber,
             maxCheckInDuration: maxCheckInDuration,
+            waitingPaused: waitingPaused,
+            waitingSecondsRemaining: waitingSecondsRemaining,
             updatedAt: updatedAt
         )
     }
@@ -401,6 +408,8 @@ struct SharedActiveSessionState: Codable, Equatable {
     let intervalSeconds: Int
     let checkInNumber: Int
     let maxCheckInDuration: Int
+    let waitingPaused: Bool
+    let waitingSecondsRemaining: Int
     let updatedAt: Date
 }
 
