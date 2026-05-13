@@ -1007,7 +1007,7 @@ struct SessionView: View {
             } else {
                 Image(systemName: row.kind == .wait ? "hourglass" : "figure.walk")
                     .font(.title2)
-                    .foregroundStyle(.secondary.opacity(0.35))
+                    .foregroundStyle(accentColor.opacity(0.35))
                     .frame(width: 56, height: 56)
             }
         }
