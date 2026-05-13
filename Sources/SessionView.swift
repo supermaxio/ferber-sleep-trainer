@@ -37,6 +37,26 @@ struct CompletedSessionDraft {
     var checkIns: [ActiveCheckInDraft]
 }
 
+struct TimerRowData: Identifiable, Equatable {
+    let id: String
+    let kind: Kind
+    let number: Int
+    let plannedSeconds: Int
+    let actualSeconds: Int?
+    let displayState: DisplayState
+    
+    enum Kind: Equatable {
+        case wait
+        case checkIn
+    }
+    
+    enum DisplayState: Equatable {
+        case pending
+        case active
+        case completed
+    }
+}
+
 // MARK: - Session View Model
 
 @MainActor
@@ -125,7 +145,86 @@ final class SessionViewModel {
         return intervals.map { "\($0)m" }.joined(separator: " → ") + "+"
     }
     
-    private func formatTime(_ totalSeconds: Int) -> String {
+    /// Builds the accordion rows for the timer list.
+    /// Always shows at least 3 wait+check pairs, expanding only as the session progresses beyond #3.
+    var timerRows: [TimerRowData] {
+        var maxPair = 3
+        switch state {
+        case .waiting(_, let n): maxPair = max(maxPair, n)
+        case .checkIn(let n): maxPair = max(maxPair, n)
+        case .idle: break
+        }
+        if let checkIns = currentSessionDraft?.checkIns {
+            let highest = checkIns.map(\.checkInNumber).max() ?? 0
+            maxPair = max(maxPair, highest)
+        }
+        
+        var rows: [TimerRowData] = []
+        for n in 1...maxPair {
+            rows.append(makeWaitRow(checkInNumber: n))
+            rows.append(makeCheckInRow(checkInNumber: n))
+        }
+        return rows
+    }
+    
+    private func makeWaitRow(checkInNumber n: Int) -> TimerRowData {
+        let planned = Int(intervalForCheckIn(n))
+        let displayState: TimerRowData.DisplayState
+        var actual: Int? = nil
+        
+        if case .waiting(_, let activeN) = state, activeN == n {
+            displayState = .active
+        } else if let ci = currentSessionDraft?.checkIns.first(where: { $0.checkInNumber == n }) {
+            displayState = .completed
+            let waitStart: Date
+            if n == 1 {
+                waitStart = currentSessionDraft?.startTime ?? ci.timestamp
+            } else if let prevCi = currentSessionDraft?.checkIns.first(where: { $0.checkInNumber == n - 1 }),
+                      let prevEnd = prevCi.endTime {
+                waitStart = prevEnd
+            } else {
+                waitStart = currentSessionDraft?.startTime ?? ci.timestamp
+            }
+            actual = max(0, Int(ci.timestamp.timeIntervalSince(waitStart)))
+        } else {
+            displayState = .pending
+        }
+        
+        return TimerRowData(
+            id: "wait-\(n)",
+            kind: .wait,
+            number: n,
+            plannedSeconds: planned,
+            actualSeconds: actual,
+            displayState: displayState
+        )
+    }
+    
+    private func makeCheckInRow(checkInNumber n: Int) -> TimerRowData {
+        let displayState: TimerRowData.DisplayState
+        var actual: Int? = nil
+        
+        if case .checkIn(let activeN) = state, activeN == n {
+            displayState = .active
+        } else if let ci = currentSessionDraft?.checkIns.first(where: { $0.checkInNumber == n }),
+                  let endTime = ci.endTime {
+            displayState = .completed
+            actual = max(0, Int(endTime.timeIntervalSince(ci.timestamp)))
+        } else {
+            displayState = .pending
+        }
+        
+        return TimerRowData(
+            id: "check-\(n)",
+            kind: .checkIn,
+            number: n,
+            plannedSeconds: maxCheckInDuration,
+            actualSeconds: actual,
+            displayState: displayState
+        )
+    }
+    
+    func formatTime(_ totalSeconds: Int) -> String {
         let hours = totalSeconds / 3600
         let minutes = (totalSeconds % 3600) / 60
         let seconds = totalSeconds % 60
@@ -653,19 +752,16 @@ struct SessionView: View {
                 // Header
                 headerView
                     .padding(.top, 20)
+                    .padding(.horizontal, 24)
                 
-                Spacer()
-                
-                // Main timer area
-                mainContent
-                
-                Spacer()
+                // Timer accordion
+                timerAccordion
                 
                 // Bottom action area
                 bottomActions
-                    .padding(.bottom, 40)
+                    .padding(.bottom, 32)
+                    .padding(.horizontal, 24)
             }
-            .padding(.horizontal, 24)
         }
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showHistory) {
@@ -818,141 +914,283 @@ struct SessionView: View {
         }
     }
     
-    // MARK: - Main Content
+    // MARK: - Timer Accordion
     
     @ViewBuilder
-    private var mainContent: some View {
-        switch viewModel.state {
-        case .idle:
-            idleView
-        case .waiting(_, let checkInNumber):
-            waitingView(checkInNumber)
-        case .checkIn(let checkInNumber):
-            checkInView(checkInNumber: checkInNumber)
+    private var timerAccordion: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    let rows = viewModel.timerRows
+                    ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                        timerRowView(row, isFirst: index == 0)
+                            .id(row.id)
+                        
+                        if index < rows.count - 1 {
+                            Rectangle()
+                                .fill(Color.white.opacity(0.08))
+                                .frame(height: 0.5)
+                        }
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 8)
+            }
+            .onChange(of: activeRowID) { _, newID in
+                guard let newID else { return }
+                withAnimation {
+                    proxy.scrollTo(newID, anchor: .center)
+                }
+            }
         }
     }
     
-    // MARK: - Idle View
+    private var activeRowID: String? {
+        viewModel.timerRows.first(where: { $0.displayState == .active })?.id
+    }
     
-    private var idleView: some View {
-        VStack(spacing: 32) {
-            Image(systemName: "moon.zzz.fill")
-                .font(.system(size: 80))
-                .foregroundStyle(.indigo.gradient)
-            
-            VStack(spacing: 8) {
-                Text("Ready for Night \(viewModel.currentNight)")
-                    .font(.title2)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(.white)
+    @ViewBuilder
+    private func timerRowView(_ row: TimerRowData, isFirst: Bool) -> some View {
+        if row.displayState == .active {
+            if row.kind == .wait {
+                activeWaitRow(row)
+            } else {
+                activeCheckInRow(row)
+            }
+        } else {
+            collapsedTimerRow(row, isFirst: isFirst)
+        }
+    }
+    
+    private func collapsedTimerRow(_ row: TimerRowData, isFirst: Bool) -> some View {
+        let displaySeconds = row.actualSeconds ?? row.plannedSeconds
+        let isIdleStart = viewModel.state == .idle && isFirst
+        let opacity: Double = row.displayState == .completed ? 0.4 : (viewModel.state == .idle ? 0.75 : 0.5)
+        let accentColor: Color = row.kind == .wait ? .orange : .teal
+        
+        return HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(viewModel.formatTime(displaySeconds))
+                    .font(.system(size: 48, weight: .light, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(opacity))
                 
-                Text("Intervals: \(viewModel.formattedIntervals)")
+                Text(collapsedSubtitle(for: row))
                     .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary.opacity(opacity))
             }
             
-            VStack(spacing: 18) {
+            Spacer()
+            
+            if isIdleStart {
                 Button {
                     viewModel.startSession(modelContext: modelContext)
                     refreshLocalSessions()
                     publishActiveSessionState()
                 } label: {
-                    Label("Start Session", systemImage: "play.fill")
-                        .font(.title3)
-                        .fontWeight(.semibold)
-                        .foregroundStyle(.black)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 18)
-                        .background(.white, in: RoundedRectangle(cornerRadius: 16))
+                    ZStack {
+                        Circle()
+                            .fill(accentColor)
+                            .frame(width: 56, height: 56)
+                        Image(systemName: "play.fill")
+                            .font(.title2)
+                            .foregroundStyle(.black)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Start Session")
+            } else if row.displayState == .completed {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.title)
+                    .foregroundStyle(accentColor.opacity(0.5))
+                    .frame(width: 56, height: 56)
+            } else {
+                Image(systemName: row.kind == .wait ? "hourglass" : "figure.walk")
+                    .font(.title2)
+                    .foregroundStyle(accentColor.opacity(0.35))
+                    .frame(width: 56, height: 56)
+            }
+        }
+        .padding(.vertical, 12)
+    }
+    
+    private func collapsedSubtitle(for row: TimerRowData) -> String {
+        let mins = max(1, row.plannedSeconds / 60)
+        switch row.kind {
+        case .wait:
+            return "Wait #\(row.number) · \(mins) min"
+        case .checkIn:
+            return "Check-in #\(row.number) · max \(mins) min"
+        }
+    }
+    
+    // MARK: - Active Wait Row
+    
+    private func activeWaitRow(_ row: TimerRowData) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(viewModel.formattedWaitingTime)
+                        .font(.system(size: 64, weight: .light, design: .rounded))
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                        .animation(.linear(duration: 0.1), value: viewModel.waitingSecondsRemaining)
+                        .foregroundStyle(viewModel.waitingPaused ? .white.opacity(0.5) : .white)
+                    
+                    Label(viewModel.waitingPaused ? "Paused" : "Wait #\(row.number)",
+                          systemImage: viewModel.waitingPaused ? "pause.circle" : "hourglass")
+                        .font(.caption)
+                        .foregroundStyle(.orange.opacity(0.85))
+                }
+                
+                Spacer()
+                
+                Button {
+                    if viewModel.waitingPaused {
+                        viewModel.resumeWaiting()
+                    } else {
+                        viewModel.pauseWaiting()
+                    }
+                    publishActiveSessionState()
+                } label: {
+                    ZStack {
+                        Circle()
+                            .stroke(Color.orange, lineWidth: 2)
+                            .frame(width: 72, height: 72)
+                        Image(systemName: viewModel.waitingPaused ? "play.fill" : "pause.fill")
+                            .font(.title)
+                            .foregroundStyle(.orange)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(viewModel.waitingPaused ? "Resume" : "Pause")
+            }
+            
+            ProgressView(value: viewModel.waitingProgress)
+                .progressViewStyle(WaitProgressStyle())
+                .frame(height: 6)
+            
+            HStack(spacing: 20) {
+                Button {
+                    if row.number == 1 {
+                        let cancelledState = viewModel.makeSharedEndedSessionState(phase: .cancelled)
+                        viewModel.cancelSessionSilently()
+                        refreshLocalSessions()
+                        publishActiveSessionState(cancelledState)
+                    } else {
+                        viewModel.goBackFromWaiting()
+                        publishActiveSessionState()
+                    }
+                } label: {
+                    Image(systemName: "chevron.backward")
+                        .font(.body)
+                        .foregroundStyle(.orange.opacity(0.6))
+                        .frame(width: 36, height: 36)
                 }
                 .buttonStyle(.plain)
                 
-                recentSessionsView
+                Button {
+                    viewModel.restartWaiting()
+                    publishActiveSessionState()
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.body)
+                        .foregroundStyle(.orange.opacity(0.6))
+                        .frame(width: 36, height: 36)
+                }
+                .buttonStyle(.plain)
+                
+                Spacer()
             }
-            .padding(.top, 16)
+            
+            Button {
+                viewModel.startCheckIn(modelContext: modelContext)
+                refreshLocalSessions()
+                publishActiveSessionState()
+            } label: {
+                Label("Check In", systemImage: "figure.walk")
+                    .font(.headline)
+                    .foregroundStyle(viewModel.waitingSecondsRemaining == 0 ? .black : .orange)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                    .background(
+                        viewModel.waitingSecondsRemaining == 0 ? .orange : .orange.opacity(0.18),
+                        in: RoundedRectangle(cornerRadius: 14)
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 14)
+                            .stroke(.orange.opacity(0.7), lineWidth: 1)
+                    }
+            }
+            .buttonStyle(.plain)
         }
+        .padding(.vertical, 16)
+    }
+    
+    // MARK: - Active Check-In Row
+    
+    private func activeCheckInRow(_ row: TimerRowData) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(viewModel.formattedCheckInTimeRemaining)
+                        .font(.system(size: 64, weight: .light, design: .rounded))
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                        .animation(.linear(duration: 0.1), value: viewModel.checkInSecondsElapsed)
+                        .foregroundStyle(checkInTimeColor)
+                    
+                    Label("Check-in #\(row.number)", systemImage: "figure.and.child.holdinghands")
+                        .font(.caption)
+                        .foregroundStyle(.teal.opacity(0.9))
+                }
+                
+                Spacer()
+            }
+            
+            ProgressView(value: viewModel.checkInProgress)
+                .progressViewStyle(CheckInProgressStyle())
+                .frame(height: 6)
+            
+            HStack(spacing: 12) {
+                Button {
+                    viewModel.goBackFromCheckIn()
+                    publishActiveSessionState()
+                } label: {
+                    Image(systemName: "chevron.backward")
+                        .font(.body)
+                        .foregroundStyle(.teal.opacity(0.6))
+                        .frame(width: 36, height: 36)
+                }
+                .buttonStyle(.plain)
+                
+                Text(checkInGuidanceText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                
+                Spacer()
+            }
+            
+            Button {
+                viewModel.finishCheckIn(modelContext: modelContext)
+                refreshLocalSessions()
+                publishActiveSessionState()
+            } label: {
+                Label("Done Checking", systemImage: "checkmark")
+                    .font(.headline)
+                    .foregroundStyle(.black)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                    .background(.teal, in: RoundedRectangle(cornerRadius: 14))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 16)
     }
     
     private var formattedCheckInDurationLimit: String {
         let minutes = max(1, checkInDurationLimit)
         return "\(minutes) minute\(minutes == 1 ? "" : "s")"
-    }
-    
-    private var currentNightSessions: [RecentSessionSummary] {
-        displayedSessions.filter { $0.nightNumber == currentNight }
-    }
-    
-    private var displayedSessions: [RecentSessionSummary] {
-        recentSessionSummaries
-    }
-    
-    private var completedCurrentNightSessions: Int {
-        currentNightSessions.filter(\.isCompleted).count
-    }
-    
-    @ViewBuilder
-    private var recentSessionsView: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Night \(currentNight) sessions")
-                    .font(.caption)
-                    .fontWeight(.medium)
-                    .foregroundStyle(.secondary)
-                
-                Spacer()
-                
-                Text("\(completedCurrentNightSessions) completed")
-                    .font(.caption)
-                    .fontWeight(.medium)
-                    .foregroundStyle(.secondary)
-            }
-            
-            if currentNightSessions.isEmpty {
-                Text("No sessions recorded for this night yet")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary.opacity(0.75))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                VStack(spacing: 6) {
-                    ForEach(Array(currentNightSessions.prefix(3))) { session in
-                        recentSessionRow(session)
-                    }
-                }
-            }
-            
-            Text("Saved locally: \(displayedSessions.count)")
-                .font(.caption2)
-                .foregroundStyle(.secondary.opacity(0.45))
-        }
-        .padding(.horizontal, 4)
-    }
-    
-    private func recentSessionRow(_ session: RecentSessionSummary) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: session.isCompleted ? "checkmark.circle.fill" : "xmark.circle")
-                .font(.caption)
-                .foregroundStyle(session.isCompleted ? .teal.opacity(0.75) : .secondary.opacity(0.6))
-            
-            VStack(alignment: .leading, spacing: 2) {
-                Text(session.formattedDate)
-                Text("\(session.formattedStartTime) - \(session.formattedEndTime)")
-                    .foregroundStyle(.secondary.opacity(0.62))
-            }
-                .font(.caption2)
-                .foregroundStyle(.secondary.opacity(0.82))
-            
-            Spacer()
-            
-            VStack(alignment: .trailing, spacing: 2) {
-                Text(session.isCompleted ? session.formattedTotalDuration : "Ended")
-                Text("\(session.checkInCount) check-ins")
-                    .foregroundStyle(.secondary.opacity(0.62))
-            }
-            .font(.caption2)
-            .foregroundStyle(.secondary.opacity(0.72))
-            .monospacedDigit()
-        }
     }
     
     private func migrateCheckInDurationLimitToMinutes() {
@@ -1003,190 +1241,6 @@ struct SessionView: View {
                 return true
             }
     }
-    
-    // MARK: - Waiting View
-    
-    @ViewBuilder
-    private func waitingView(_ checkInNumber: Int) -> some View {
-        VStack(spacing: 24) {
-                // Status label
-                Label(viewModel.waitingPaused ? "Paused" : "Waiting", systemImage: viewModel.waitingPaused ? "pause.circle" : "hourglass")
-                    .font(.subheadline)
-                    .fontWeight(.medium)
-                    .foregroundStyle(.orange.opacity(0.8))
-                
-                // Main countdown timer
-                Text(viewModel.formattedWaitingTime)
-                    .font(.system(size: 96, weight: .light, design: .rounded))
-                    .foregroundStyle(viewModel.waitingPaused ? .white.opacity(0.4) : .white)
-                    .monospacedDigit()
-                    .contentTransition(.numericText())
-                    .animation(.linear(duration: 0.1), value: viewModel.waitingSecondsRemaining)
-                
-                // Timer controls
-                HStack(spacing: 32) {
-                    Button {
-                        if checkInNumber == 1 {
-                            let cancelledState = viewModel.makeSharedEndedSessionState(phase: .cancelled)
-                            viewModel.cancelSessionSilently()
-                            refreshLocalSessions()
-                            publishActiveSessionState(cancelledState)
-                        } else {
-                            viewModel.goBackFromWaiting()
-                            publishActiveSessionState()
-                        }
-                    } label: {
-                        Image(systemName: "chevron.backward")
-                            .font(.body)
-                            .foregroundStyle(.orange.opacity(0.5))
-                    }
-                    .buttonStyle(.plain)
-                    
-                    Button {
-                        viewModel.restartWaiting()
-                        publishActiveSessionState()
-                    } label: {
-                        Image(systemName: "arrow.counterclockwise")
-                            .font(.body)
-                            .foregroundStyle(.orange.opacity(0.5))
-                    }
-                    .buttonStyle(.plain)
-                    
-                    Button {
-                        if viewModel.waitingPaused {
-                            viewModel.resumeWaiting()
-                        } else {
-                            viewModel.pauseWaiting()
-                        }
-                        publishActiveSessionState()
-                    } label: {
-                        Image(systemName: viewModel.waitingPaused ? "play.fill" : "pause.fill")
-                            .font(.body)
-                            .foregroundStyle(.orange.opacity(0.5))
-                    }
-                    .buttonStyle(.plain)
-                }
-                
-                // Progress ring
-                ZStack {
-                    Circle()
-                        .stroke(Color.white.opacity(0.1), lineWidth: 6)
-                    
-                    Circle()
-                        .trim(from: 0, to: viewModel.waitingProgress)
-                        .stroke(
-                            AngularGradient(
-                                colors: [.orange, .yellow, .orange],
-                                center: .center
-                            ),
-                            style: StrokeStyle(lineWidth: 6, lineCap: .round)
-                        )
-                        .rotationEffect(.degrees(-90))
-                        .animation(.linear(duration: 1), value: viewModel.waitingProgress)
-                }
-                .frame(width: 120, height: 120)
-                
-                // Next check-in info
-                VStack(spacing: 4) {
-                    Text("Check-in #\(checkInNumber)")
-                        .font(.headline)
-                        .foregroundStyle(.white)
-                    
-                    Text("Interval: \(Int(viewModel.intervalForCheckIn(checkInNumber) / 60)) minutes")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.top, 8)
-                
-                Button {
-                    viewModel.startCheckIn(modelContext: modelContext)
-                    refreshLocalSessions()
-                    publishActiveSessionState()
-                } label: {
-                    Label("Check In", systemImage: "figure.walk")
-                        .font(.headline)
-                        .foregroundStyle(viewModel.waitingSecondsRemaining == 0 ? .black : .orange)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 16)
-                        .background(
-                            viewModel.waitingSecondsRemaining == 0 ? .orange : .orange.opacity(0.18),
-                            in: RoundedRectangle(cornerRadius: 14)
-                        )
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 14)
-                                .stroke(.orange.opacity(0.7), lineWidth: 1)
-                        }
-                }
-                .buttonStyle(.plain)
-                .padding(.top, 16)
-            }
-        }
-    
-    // MARK: - Check-In View
-    
-    @ViewBuilder
-    private func checkInView(checkInNumber: Int) -> some View {
-        VStack(spacing: 24) {
-                // Status label
-                Label("Check-In #\(checkInNumber)", systemImage: "figure.and.child.holdinghands")
-                    .font(.subheadline)
-                    .fontWeight(.medium)
-                    .foregroundStyle(.teal.opacity(0.9))
-                
-                // Countdown timer
-                Text(viewModel.formattedCheckInTimeRemaining)
-                    .font(.system(size: 96, weight: .light, design: .rounded))
-                    .foregroundStyle(checkInTimeColor)
-                    .monospacedDigit()
-                    .contentTransition(.numericText())
-                    .animation(.linear(duration: 0.1), value: viewModel.checkInSecondsElapsed)
-                
-                Button {
-                    viewModel.goBackFromCheckIn()
-                    publishActiveSessionState()
-                } label: {
-                    Image(systemName: "chevron.backward")
-                        .font(.body)
-                        .foregroundStyle(.teal.opacity(0.5))
-                }
-                .buttonStyle(.plain)
-                
-                // Progress indicator
-                ProgressView(value: viewModel.checkInProgress)
-                    .progressViewStyle(CheckInProgressStyle())
-                    .frame(height: 8)
-                    .padding(.horizontal, 32)
-                
-                // Guidance text
-                VStack(spacing: 4) {
-                    Text(checkInGuidanceText)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                    
-                    Text("Max \(formattedCheckInDurationLimit) recommended")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary.opacity(0.7))
-                }
-                .padding(.top, 8)
-                
-                // Done checking button
-                Button {
-                    viewModel.finishCheckIn(modelContext: modelContext)
-                    refreshLocalSessions()
-                    publishActiveSessionState()
-                } label: {
-                    Label("Done Checking", systemImage: "checkmark")
-                        .font(.headline)
-                        .foregroundStyle(.black)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 16)
-                        .background(.teal, in: RoundedRectangle(cornerRadius: 14))
-                }
-                .buttonStyle(.plain)
-                .padding(.top, 16)
-            }
-        }
     
     private var checkInTimeColor: Color {
         if viewModel.checkInSecondsElapsed >= viewModel.maxCheckInDuration {
@@ -1310,21 +1364,21 @@ struct SessionView: View {
                     publishActiveSessionState(endedState)
                     syncHouseholdIfConfigured()
                 } label: {
-                    HStack(spacing: 12) {
+                    HStack(spacing: 10) {
                         Image(systemName: "moon.zzz.fill")
-                            .font(.title2)
-                        Text("Baby Fell Asleep")
                             .font(.title3)
+                        Text("Baby Fell Asleep")
+                            .font(.headline)
                             .fontWeight(.semibold)
                     }
                     .foregroundStyle(.indigo)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 20)
+                    .padding(.vertical, 14)
                     .background(
-                        RoundedRectangle(cornerRadius: 16)
+                        RoundedRectangle(cornerRadius: 14)
                             .stroke(.indigo.opacity(0.6), lineWidth: 2)
                             .background(
-                                RoundedRectangle(cornerRadius: 16)
+                                RoundedRectangle(cornerRadius: 14)
                                     .fill(.indigo.opacity(0.15))
                             )
                     )
@@ -1346,6 +1400,28 @@ struct SessionView: View {
 }
 
 // MARK: - Custom Progress Style
+
+struct WaitProgressStyle: ProgressViewStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(Color.white.opacity(0.1))
+                
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(
+                        LinearGradient(
+                            colors: [.orange, .yellow],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(width: geometry.size.width * (configuration.fractionCompleted ?? 0))
+                    .animation(.linear(duration: 0.5), value: configuration.fractionCompleted)
+            }
+        }
+    }
+}
 
 struct CheckInProgressStyle: ProgressViewStyle {
     func makeBody(configuration: Configuration) -> some View {
