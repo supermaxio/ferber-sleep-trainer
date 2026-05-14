@@ -17,13 +17,13 @@
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.1</string>
+	<string>1.2</string>
 	<key>CFBundleVersion</key>
 	<string>2</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSUserNotificationUsageDescription</key>
-	<string>Ferber Sleep Trainer uses notifications to alert you when it's time to check on your baby during sleep training sessions.</string>
+	<string>Ferber Sleep Trainer uses notifications to alert you when it&apos;s time to check on your baby during sleep training sessions.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

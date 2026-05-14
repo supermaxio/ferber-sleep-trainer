@@ -732,6 +732,7 @@ struct SessionView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
     @Query(sort: \SleepSession.startTime, order: .reverse) private var sessions: [SleepSession]
+    @Query(sort: \NightConfiguration.nightNumber) private var nightConfigurations: [NightConfiguration]
     @AppStorage("currentNight") private var currentNight: Int = 1
     @AppStorage("checkInDurationLimit") private var checkInDurationLimit: Int = 2
     @AppStorage("householdCode") private var householdCode: String = ""
@@ -772,6 +773,7 @@ struct SessionView: View {
         }
         .onAppear {
             migrateCheckInDurationLimitToMinutes()
+            ensureNightConfigurationsExist()
             viewModel.currentNight = currentNight
             viewModel.maxCheckInDuration = checkInDurationLimit * 60
             viewModel.loadNightConfiguration(modelContext: modelContext)
@@ -857,17 +859,21 @@ struct SessionView: View {
                     .foregroundStyle(.indigo.opacity(0.9))
                 
                 Button {
-                    goToNextNight()
+                    if currentNight < maxNight {
+                        goToNextNight()
+                    } else {
+                        addNight()
+                    }
                 } label: {
-                    Image(systemName: "chevron.right")
+                    Image(systemName: currentNight < maxNight ? "chevron.right" : "plus")
                         .font(.caption.weight(.bold))
                         .frame(width: 28, height: 28)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(currentNight == 7 ? Color.secondary.opacity(0.35) : Color.indigo)
-                .disabled(currentNight == 7 || viewModel.state != .idle)
-                .accessibilityLabel("Next Night")
+                .foregroundStyle(viewModel.state != .idle ? Color.secondary.opacity(0.35) : Color.indigo)
+                .disabled(viewModel.state != .idle)
+                .accessibilityLabel(currentNight < maxNight ? "Next Night" : "Add Night")
             }
             
             Spacer()
@@ -973,7 +979,7 @@ struct SessionView: View {
                 Text(viewModel.formatTime(displaySeconds))
                     .font(.system(size: 48, weight: .light, design: .rounded))
                     .monospacedDigit()
-                    .foregroundStyle(.white.opacity(opacity))
+                    .foregroundStyle(accentColor.opacity(0.5))
                 
                 Text(collapsedSubtitle(for: row))
                     .font(.caption)
@@ -1007,7 +1013,7 @@ struct SessionView: View {
             } else {
                 Image(systemName: row.kind == .wait ? "hourglass" : "figure.walk")
                     .font(.title2)
-                    .foregroundStyle(accentColor.opacity(0.35))
+                    .foregroundStyle(accentColor.opacity(0.5))
                     .frame(width: 56, height: 56)
             }
         }
@@ -1201,12 +1207,69 @@ struct SessionView: View {
         }
     }
     
+    private var maxNight: Int {
+        nightConfigurations.last?.nightNumber ?? 7
+    }
+    
+    private func ensureNightConfigurationsExist() {
+        let descriptor = FetchDescriptor<NightConfiguration>()
+        let existing = (try? modelContext.fetch(descriptor)) ?? []
+        guard existing.isEmpty else { return }
+        
+        for config in NightConfiguration.defaultConfigurations() {
+            modelContext.insert(config)
+        }
+        do {
+            try modelContext.save()
+        } catch {
+            print("Failed to seed default night configurations: \(error)")
+        }
+    }
+    
     private func goToPreviousNight() {
         currentNight = max(currentNight - 1, 1)
     }
     
     private func goToNextNight() {
-        currentNight = min(currentNight + 1, 7)
+        currentNight = min(currentNight + 1, maxNight)
+    }
+    
+    private func addNight() {
+        // Read directly from the modelContext so the values are fresh within this call.
+        // @Query is async and would still be stale after we insert.
+        let descriptor = FetchDescriptor<NightConfiguration>(
+            sortBy: [SortDescriptor(\.nightNumber)]
+        )
+        var existing = (try? modelContext.fetch(descriptor)) ?? []
+        
+        if existing.isEmpty {
+            for config in NightConfiguration.defaultConfigurations() {
+                modelContext.insert(config)
+            }
+            do {
+                try modelContext.save()
+            } catch {
+                print("Failed to seed default night configurations: \(error)")
+            }
+            existing = (try? modelContext.fetch(descriptor)) ?? []
+        }
+        
+        let newNumber = (existing.last?.nightNumber ?? 0) + 1
+        let defaults = NightConfiguration.defaultIntervals(for: newNumber)
+        let config = NightConfiguration(
+            nightNumber: newNumber,
+            firstInterval: defaults[0],
+            secondInterval: defaults[1],
+            thirdInterval: defaults[2],
+            subsequentInterval: defaults[3]
+        )
+        modelContext.insert(config)
+        do {
+            try modelContext.save()
+        } catch {
+            print("Failed to save new night: \(error)")
+        }
+        currentNight = newNumber
     }
     
     private func refreshLocalSessions() {

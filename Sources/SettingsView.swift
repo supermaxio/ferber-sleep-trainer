@@ -37,7 +37,7 @@ struct SettingsView: View {
                 Form {
                     // MARK: - Current Night Section
                     Section {
-                        Stepper(value: $currentNight, in: 1...7) {
+                        Stepper(value: $currentNight, in: 1...maxNight) {
                             HStack {
                                 Image(systemName: "moon.stars.fill")
                                     .foregroundStyle(.indigo)
@@ -47,7 +47,7 @@ struct SettingsView: View {
                         }
                         .accessibilityLabel("Current night number")
                         .accessibilityValue("\(currentNight)")
-                        .accessibilityHint("Adjust from 1 to 7")
+                        .accessibilityHint("Adjust from 1 to \(maxNight)")
                     } header: {
                         Text("Current Night")
                             .foregroundColor(.gray)
@@ -100,11 +100,24 @@ struct SettingsView: View {
                                 }
                             }
                         }
+                        .onMove(perform: moveNight)
+                        
+                        Button {
+                            addNight()
+                        } label: {
+                            HStack {
+                                Image(systemName: "plus.circle.fill")
+                                    .foregroundStyle(.green)
+                                Text("Add Night")
+                                    .foregroundColor(.white)
+                            }
+                        }
+                        .accessibilityLabel("Add a new night")
                     } header: {
                         Text("Intervals Per Night")
                             .foregroundColor(.gray)
                     } footer: {
-                        Text("Customize wait times between check-ins for each night. Tap a night to edit its intervals.")
+                        Text("Customize wait times between check-ins for each night. Tap a night to edit its intervals. Use the Edit button to reorder.")
                             .foregroundColor(.gray)
                     }
                     .listRowBackground(Color(white: 0.12))
@@ -251,6 +264,10 @@ struct SettingsView: View {
             .navigationBarTitleDisplayMode(.large)
             .preferredColorScheme(.dark)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    EditButton()
+                        .foregroundColor(.blue)
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") {
                         dismiss()
@@ -324,6 +341,63 @@ struct SettingsView: View {
         return Array(nightConfigurations)
     }
     
+    private var maxNight: Int {
+        max(1, effectiveNightConfigurations.last?.nightNumber ?? 7)
+    }
+    
+    private func addNight() {
+        ensureNightConfigurationsExist()
+        
+        let descriptor = FetchDescriptor<NightConfiguration>(
+            sortBy: [SortDescriptor(\.nightNumber)]
+        )
+        let existing = (try? modelContext.fetch(descriptor)) ?? []
+        let newNumber = (existing.last?.nightNumber ?? 0) + 1
+        let defaults = NightConfiguration.defaultIntervals(for: newNumber)
+        let config = NightConfiguration(
+            nightNumber: newNumber,
+            firstInterval: defaults[0],
+            secondInterval: defaults[1],
+            thirdInterval: defaults[2],
+            subsequentInterval: defaults[3]
+        )
+        modelContext.insert(config)
+        do {
+            try modelContext.save()
+        } catch {
+            print("Failed to save new night: \(error)")
+        }
+    }
+    
+    private func moveNight(from source: IndexSet, to destination: Int) {
+        ensureNightConfigurationsExist()
+        
+        let descriptor = FetchDescriptor<NightConfiguration>(
+            sortBy: [SortDescriptor(\.nightNumber)]
+        )
+        var ordered = (try? modelContext.fetch(descriptor)) ?? []
+        
+        let activeConfig = ordered.first(where: { $0.nightNumber == currentNight })
+        
+        ordered.move(fromOffsets: source, toOffset: destination)
+        
+        for (index, config) in ordered.enumerated() {
+            config.nightNumber = index + 1
+        }
+        
+        do {
+            try modelContext.save()
+        } catch {
+            print("Failed to save reordered nights: \(error)")
+        }
+        
+        if let activeConfig {
+            currentNight = activeConfig.nightNumber
+        } else {
+            currentNight = min(max(currentNight, 1), max(1, ordered.last?.nightNumber ?? 7))
+        }
+    }
+    
     /// Format intervals for display (e.g., "3, 5, 10, 10+ min")
     private func formatIntervals(_ config: NightConfiguration) -> String {
         let intervals = config.intervals
@@ -337,15 +411,22 @@ struct SettingsView: View {
         }
     }
     
-    /// Ensure night configurations exist in SwiftData
+    /// Ensure night configurations exist in SwiftData. Uses a direct fetch so
+    /// the check is accurate within the same call (unlike @Query, which is stale until re-render).
     private func ensureNightConfigurationsExist() {
-        guard nightConfigurations.isEmpty else { return }
+        let descriptor = FetchDescriptor<NightConfiguration>()
+        let existing = (try? modelContext.fetch(descriptor)) ?? []
+        guard existing.isEmpty else { return }
         
         for config in NightConfiguration.defaultConfigurations() {
             modelContext.insert(config)
         }
         
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            print("Failed to save default night configurations: \(error)")
+        }
     }
     
     /// Reset all intervals to Ferber defaults
@@ -535,8 +616,8 @@ struct HistoryCSVImporter {
         let fellAsleepText = trimmed(row[4]).lowercased()
         let checkInsText = trimmed(row[5])
         
-        guard let nightNumber = Int(nightText), (1...7).contains(nightNumber) else {
-            throw HistoryCSVImportError.invalidRow(line: line, reason: "Night must be a number from 1 to 7.")
+        guard let nightNumber = Int(nightText), nightNumber >= 1 else {
+            throw HistoryCSVImportError.invalidRow(line: line, reason: "Night must be a positive number.")
         }
         
         guard let startTime = makeDate(date: dateText, time: startTimeText) else {
@@ -697,6 +778,7 @@ struct NightIntervalEditView: View {
     @State private var secondInterval: Int = 5
     @State private var thirdInterval: Int = 10
     @State private var subsequentInterval: Int = 10
+    @State private var resolvedConfiguration: NightConfiguration?
     
     var body: some View {
         ZStack {
@@ -815,7 +897,19 @@ struct NightIntervalEditView: View {
     // MARK: - Methods
     
     private func loadConfiguration() {
-        if let config = configuration {
+        // Prefer the passed-in configuration, otherwise resolve via direct fetch so
+        // we work even when the parent's @Query is stale (e.g. just after addNight).
+        let nightNumber = nightNumber
+        let found: NightConfiguration? = configuration ?? {
+            let descriptor = FetchDescriptor<NightConfiguration>(
+                predicate: #Predicate { $0.nightNumber == nightNumber }
+            )
+            return try? modelContext.fetch(descriptor).first
+        }()
+        
+        resolvedConfiguration = found
+        
+        if let config = found {
             firstInterval = config.firstInterval
             secondInterval = config.secondInterval
             thirdInterval = config.thirdInterval
@@ -838,14 +932,12 @@ struct NightIntervalEditView: View {
     }
     
     private func saveConfiguration() {
-        if let config = configuration {
-            // Update existing configuration
+        if let config = resolvedConfiguration {
             config.firstInterval = firstInterval
             config.secondInterval = secondInterval
             config.thirdInterval = thirdInterval
             config.subsequentInterval = subsequentInterval
         } else {
-            // Create new configuration
             let newConfig = NightConfiguration(
                 nightNumber: nightNumber,
                 firstInterval: firstInterval,
@@ -854,9 +946,14 @@ struct NightIntervalEditView: View {
                 subsequentInterval: subsequentInterval
             )
             modelContext.insert(newConfig)
+            resolvedConfiguration = newConfig
         }
         
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            print("Failed to save night \(nightNumber) configuration: \(error)")
+        }
     }
 }
 
